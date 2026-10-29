@@ -1,0 +1,3096 @@
+#!/usr/bin/env python3
+# coding: utf-8
+import json
+import logging
+import time
+import requests
+import os
+import base64
+import xml.etree.ElementTree as ET                                                    # to parse XML transaction messages sent by Clixon callback plugin
+import threading
+import ipaddress
+
+from http.server import BaseHTTPRequestHandler, HTTPServer                            # internal HTTP server for receiving Clixon callback messages
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+from xml.sax.saxutils import escape
+
+from config_reader import ConfigReader
+from monitoring_manager import MonitoringManager  
+from metric_reader import MetricReader                  
+
+logging.basicConfig(level=logging.INFO)                                               # to show info messages and errors
+
+class Agent:
+    def __init__(self):
+        self.config_reader = ConfigReader()
+        self.monitoring_manager = MonitoringManager()    
+        self.metric_reader = MetricReader()    
+        
+        self.current_config_cache = {}
+        self.latest_flow_state_map = {}                                               # latest per traffic class/WAN metric snapshot
+        self.latest_tunnel_state_map = {}                                             # latest per tunnel metric snapshot
+
+        self.latest_cpe_state = {                                                     # runtime-only overall CPE operational snapshot
+            "oper-status": "unknown",
+            "power-status": "powered-on",
+            "forwarder-status": "unknown",
+            "forwarder-version": None,
+            "uptime-seconds": 0,
+            "last-seen": None,
+            "status-reason": "CPE state not evaluated yet" }
+        
+        self.agent_start_time = time.time()                                           # used to calculate Agent runtime uptime
+        
+        self.generated_tunnel_keys = {}                                               # stores generated WireGuard keys during the current agent runtime
+        self.wan_nat_types = {}                                                       # latest discovered NAT type for each WAN link
+        self.wan_last_ipv4 = {}                                                       # last observed WAN IPv4, used to detect DHCP/ static IP changes
+        self.flow_id_fwmarks = {}                                                     # stores generated fwmark to use for monitoring flow id
+        self.forwarder_base_url = "http://host.docker.internal:9090"                  # fixed forwarder API URL used by the agent
+        self.forwarder_dry_run = False                                                # If forwarder is not ready yet,a dry-run "true" (false send real API calls)
+
+        self.applied_steering_decisions = {}                                          # traffic-class & currently applied decision key info
+        self.pending_steering_decisions = {}                                          # traffic-class & candidate decision waiting for confirmation
+        self.steering_confirm_cycles = 3                                              # wait and check whether decision is same for 03 consecutive cycles
+
+        self.startup_reconciled = False
+        self.startup_reconcile_started = False
+        self.startup_reconcile_lock = threading.Lock()
+        self.startup_reconcile_event = threading.Event()
+    # =====================================================================================
+    # Basic helpers
+    # =====================================================================================
+    def _index_states_by_name(self, states):                                          # called by "_make_steering_decisions()"
+        indexed = {}
+        for item in states:                                                           # Loops through each state item in the list
+            name = item.get("name")                                                   # Reads the name field from the state dictionary
+            if name:
+                indexed[name] = item                                                  # If the state has a name, store that item in the dictionary using the name as key
+        return indexed
+
+    def _local_name(self, tag):
+        if tag is None:
+            return ""
+        if "}" in tag:
+            return tag.split("}", 1)[1]                                               # splits the string variable tag at the first } and returns everything that comes after it
+        return tag
+
+    def _first_child(self, element):
+        if element is None:
+            return None
+        children = list(element)                                                      # gets all direct child XML nodes inside this element
+        return children[0] if children else None                                      # returns the real object inside wrappers like parent data
+
+    def _callback_object_xml(self, wrapper, fallback="data"):
+        """
+        Return the normalized semantic configuration object sent by the
+        Clixon callback plugin.
+    
+        New callback format:
+            <object-data>
+                <class|tunnel|wan-link|lan-link|rule|steering>...</...>
+            </object-data>
+    
+        Backward compatibility:
+            If object-data is not present, preserve the previous Agent
+            behavior by falling back either to <data> or <parent-data>.
+        """
+    
+        if wrapper is None:
+            return None
+    
+        # -------------------------------------------------------------
+        # Preferred new callback contract
+        # -------------------------------------------------------------
+        object_data = wrapper.find("object-data")
+        object_xml = self._first_child(object_data)
+    
+        if object_xml is not None:
+            return object_xml
+    
+        # -------------------------------------------------------------
+        # Backward compatibility with the old callback
+        # -------------------------------------------------------------
+        if fallback == "parent":
+            parent_data = wrapper.find("parent-data")
+            return self._first_child(parent_data)
+    
+        data = wrapper.find("data")
+        return self._first_child(data)
+
+    def _bool_value(self, value):                                                     # converts YANG/Clixon boolean text into real Python boolean without adding Python defaults
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() in ["true", "1", "yes"]
+
+    def _xml_to_dict(self, element):                                                  # Convert XML parent object from Clixon into a Python dictionary to avoids hardcoding every YANG leaf one by one
+        if element is None:
+            return {}
+
+        result = {}
+        for child in list(element):
+            name = self._local_name(child.tag)
+            if len(list(child)) == 0:                                                 #if this XML node has no child nodes, it is a simple leaf
+                value = child.text
+            else:
+                value = self._xml_to_dict(child)                                      #if this XML node has child nodes, convert that nested object also
+
+            if name in result:                                                        #if the same leaf/list name appears again, store values as a list
+                if not isinstance(result[name], list):
+                    result[name] = [result[name]]
+                result[name].append(value)
+            else:
+                result[name] = value
+
+        return result
+
+    def _as_list(self, value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]                                                               # single value is wrapped as a list to make later processing easier
+
+    def _has_change(self, changed_leafs, *names):                                    # agent decides whether to send a field to the forwarder.
+        if "*" in changed_leafs:
+            return True                                                              # used for added objects where the full object must be configured
+        return any(name in changed_leafs for name in names)                          # returns True if at least one requested leaf is in the changed leaf list
+
+    def _add_if_not_none(self, payload, api_field, value):
+        if value is not None:
+            payload[api_field] = value                                               # avoids sending Python defaults when the datastore did not provide a value
+
+    def _port_range(self, value):                                                    # Even when YANG has only one port, forwarder may expect port ranges. This converts a single port into forwarder format.
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if value is None or value == "any":
+            return None                                                              # no port filter is needed when the YANG value is any
+        port = int(value)                                                            # forwarder expects port numbers as integers
+        return {"start": port, "end": port}                                          # single port is represented as a range with same start and end
+
+    def _ip_from_prefix(self, prefix):
+        if not prefix:
+            return None
+        return str(prefix).split("/", 1)[0]                                          # converts 10.0.1.1/24 into 10.0.1.1 for DHCP gateway field
+
+    def _lease_time(self, seconds):
+        if seconds is None:
+            return None                                                              # YANG default is trusted, so Python does not create its own default here
+        return f"{seconds}s"                                                         # forwarder OpenAPI expects lease_time as a string such as 86400s or 24h
+
+    def _generate_wireguard_tunnel_keys(self, tunnel_name):                          # generate and save WireGuard tunnel keys uding curve25519
+        private_dir = "/var/lib/sdwan-cpe/keys"
+        public_dir = "/var/lib/clixon/local-public-keys"
+
+        private_path = f"{private_dir}/{tunnel_name}.private"                       # local private key file path for this tunnel
+        public_path = f"{public_dir}/{tunnel_name}.pub"                             # local public key file path exposed later as config false state
+
+        try:
+            if os.path.exists(private_path) and os.path.exists(public_path):        # reuse existing keys instead of generating new keys every restart
+                with open(private_path, "r") as f:
+                    private_key = f.read().strip()
+
+                with open(public_path, "r") as f:
+                    public_key = f.read().strip()
+
+                return private_key, public_key, private_path
+
+            private_key_obj = X25519PrivateKey.generate()                            # creates a new WireGuard-compatible private key
+            public_key_obj = private_key_obj.public_key()                            # derives the matching public key from the private key
+
+            private_key_bytes = private_key_obj.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption())
+
+            public_key_bytes = public_key_obj.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw)
+
+            private_key = base64.b64encode(private_key_bytes).decode("ascii")       # WireGuard keys are stored and passed as base64 text
+            public_key = base64.b64encode(public_key_bytes).decode("ascii")         # public key is also stored as base64 text
+
+            os.makedirs(private_dir, exist_ok=True)
+            os.makedirs(public_dir, exist_ok=True)
+
+            with open(private_path, "w") as f:
+                f.write(private_key)
+            os.chmod(private_path, 0o600)                                            # private key file is readable only by the owner
+
+            with open(public_path, "w") as f:
+                f.write(public_key)
+            os.chmod(public_path, 0o644)                                             # public key can be read by Clixon state plugin
+
+            logging.info("Created WireGuard keys for tunnel %s", tunnel_name)
+            return private_key, public_key, private_path
+
+        except Exception as e:
+            logging.exception("Failed to get or create WireGuard keys for tunnel %s: %s", tunnel_name, e)
+            return None, None, None
+
+    def _delete_wireguard_tunnel_keys(self, tunnel_name):                                 # remove stored WireGuard identity when tunnel is fully deleted
+        private_path = f"/var/lib/sdwan-cpe/keys/{tunnel_name}.private"
+        public_path = f"/var/lib/clixon/local-public-keys/{tunnel_name}.pub"
+    
+        for path in [private_path, public_path]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    logging.info("Deleted WireGuard key file for tunnel %s: %s", tunnel_name, path)
+            except Exception as e:
+                logging.warning("Failed to delete WireGuard key file for tunnel %s path=%s: %s", tunnel_name, path, e)
+    
+        self.generated_tunnel_keys.pop(tunnel_name, None)                                 # remove runtime key cache so recreated tunnel generates new keys
+        
+    
+    def _get_forwarder_interface_state(self, interface_name):
+        try:
+            url = f"{self.forwarder_base_url}/api/v1/interfaces/{interface_name}"  # Forwarder interface state endpoint
+    
+            response = requests.get( url, headers={"Accept": "application/json"}, timeout=5)                                                                     # ask Forwarder for current Linux interface state
+    
+            response.raise_for_status()                               
+            data = response.json()                                                # Forwarder Interface object
+    
+            ipv4_address = None                                                   # default when no address
+    
+            for address in data.get("addresses", []):                             
+                try:
+                    interface = ipaddress.ip_interface(address)                   # parse address such as 192.168.122.169/24
+    
+                    if interface.version == 4:                                    # YANG leaf currently expects IPv4
+                        ipv4_address = str(interface.ip)                          # remove prefix and keep only 192.168.122.169
+                        break
+    
+                except ValueError:
+                    continue                                                     
+    
+            forwarder_oper_state = data.get("oper_state", "unknown")              # read actual runtime link state
+    
+            if forwarder_oper_state == "up":
+                oper_status = "up"                                             
+            else:
+                oper_status = "down"                                             
+    
+            return {
+                "ipv4-address": ipv4_address,                                     # dynamically learned/static IPv4
+                "oper-status": oper_status                                        # current operational status
+            }
+    
+        except Exception as e:
+            logging.warning("Failed to read interface state for %s from Forwarder: %s", interface_name,e)
+    
+            return {
+                "ipv4-address": None,                                             # do not expose stale IP on failure
+                "oper-status": "down"                                             # failed state lookup is treated as unavailable
+            }
+
+    def _update_cpe_state(self):
+        now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    
+        forwarder_status = "down"
+        forwarder_version = None
+        status_reason = "Forwarder is unreachable"
+    
+        try:
+            response = requests.get(
+                f"{self.forwarder_base_url}/api/v1/health",
+                headers={"Accept": "application/json"},
+                timeout=5
+            )
+    
+            response.raise_for_status()
+    
+            data = response.json()
+    
+            forwarder_status = "healthy"
+            forwarder_version = data.get("version")
+            status_reason = "CPE agent and forwarder are operational"
+    
+        except Exception as e:
+            logging.warning(
+                "Forwarder health check failed: %s",
+                e
+            )
+    
+        if forwarder_status == "healthy":
+            oper_status = "up"
+        else:
+            oper_status = "degraded"
+    
+        self.latest_cpe_state = {
+            "oper-status": oper_status,
+            "power-status": "powered-on",
+            "forwarder-status": forwarder_status,
+            "forwarder-version": forwarder_version,
+            "uptime-seconds": int(
+                time.time() - self.agent_start_time
+            ),
+            "last-seen": now_ts,
+            "status-reason": status_reason
+        }
+    
+        return forwarder_status == "healthy"
+
+    def _wait_for_forwarder_healthy(self, timeout_sec=60, interval_sec=2):
+    
+        logging.info("Waiting for Forwarder health before startup reconciliation" )
+    
+        start_time = time.time()
+    
+        while time.time() - start_time < timeout_sec:
+            if self._update_cpe_state():
+                logging.info("Forwarder health check passed")
+                return True
+    
+            logging.warning("Forwarder not healthy yet; retrying in %s seconds", interval_sec)
+    
+            time.sleep(interval_sec)
+    
+        logging.error("Forwarder did not become healthy within %s seconds", timeout_sec)
+    
+        return False
+    
+    def _wait_for_wan_ready(self, wan, timeout_sec=30):
+        wan_name = wan.get("name")
+        interface_name = wan.get("interface-name")
+        role = wan.get("role")
+    
+        if not wan_name or not interface_name:
+            logging.warning("WAN readiness check skipped because WAN name or interface is missing")
+            return
+    
+        logging.info(
+            "Waiting for WAN %s interface %s to obtain IPv4",
+            wan_name,
+            interface_name
+        )
+    
+        start_time = time.time()
+    
+        try:
+            while time.time() - start_time < timeout_sec:
+    
+                interface_state = self._get_forwarder_interface_state(
+                    interface_name
+                )
+    
+                ipv4_address = interface_state.get("ipv4-address")
+    
+                logging.info(
+                    "WAN readiness poll: wan=%s interface=%s ipv4=%s oper-status=%s",
+                    wan_name,
+                    interface_name,
+                    ipv4_address,
+                    interface_state.get("oper-status")
+                )
+    
+                if ipv4_address:
+                    logging.info(
+                        "WAN %s is ready with IPv4=%s",
+                        wan_name,
+                        ipv4_address
+                    )
+    
+                    self.wan_last_ipv4[wan_name] = ipv4_address
+    
+                    self.detect_nat_type(
+                        wan_name,
+                        interface_name,
+                        role
+                    )
+    
+                    self._announce_to_controller()
+    
+                    return
+    
+                time.sleep(2)
+    
+            logging.warning(
+                "WAN %s interface %s did not obtain IPv4 within %s seconds",
+                wan_name,
+                interface_name,
+                timeout_sec
+            )
+    
+        except Exception as e:
+            logging.exception(
+                "WAN readiness thread failed for WAN %s interface %s: %s",
+                wan_name,
+                interface_name,
+                e
+            )
+            
+    # =====================================================================================
+    # Controller Annoucements
+    # =====================================================================================
+    def _announce_to_controller(self):
+        try:
+            current_config = self.config_reader.get_intended_config()                     # read system parameters from local YANG datastore
+            system = current_config.get("system", {})                                     # get CPE system configuration
+    
+            hostname = system.get("hostname")                                             # CPE hostname sent during registration
+            management_ip = system.get("management-ip")                                   # address controller uses to reach this CPE
+            controller_ip = system.get("controller-ip")                                   # preconfigured controller address
+            controller_port = system.get("controller-port")                               # preconfigured controller HTTP port
+    
+            if not hostname or not management_ip:
+                logging.warning("Cannot register CPE: hostname or management-ip is missing")
+                return False
+    
+            if not controller_ip or not controller_port:
+                logging.warning("Cannot register CPE: controller-ip or controller-port is missing")
+                return False
+    
+            payload = {
+                "hostname": hostname,
+                "management-ip": management_ip
+            }                                                                              # exact JSON currently expected by controller
+    
+            url = f"http://{controller_ip}:{controller_port}/announce"                     # build controller registration endpoint from YANG
+    
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=5
+            )                                                                              # send initial CPE registration
+    
+            response.raise_for_status()                                                    # controller should respond HTTP 200
+    
+            logging.info(
+                "CPE registration successful: hostname=%s management-ip=%s",
+                hostname,
+                management_ip
+            )
+    
+            return True
+    
+        except Exception as e:
+            logging.warning("CPE registration with controller failed: %s", e)
+            return False
+            
+    def _send_cpe_health_to_controller(self):
+        try:
+            current_config = self.config_reader.get_intended_config()
+            system = current_config.get("system", {})
+    
+            cpe_id = system.get("local-cpe-id")
+            controller_ip = system.get("controller-ip")
+            controller_port = system.get("controller-port")
+    
+            if not cpe_id:
+                logging.info(
+                    "Skipping CPE health report because local-cpe-id is not assigned yet"
+                )
+                return False
+    
+            if not controller_ip or not controller_port:
+                logging.warning(
+                    "Cannot send CPE health report because controller address is missing"
+                )
+                return False
+    
+            url = (
+                f"http://{controller_ip}:"
+                f"{controller_port}"
+                f"/healthcheck/{cpe_id}"
+            )
+    
+            response = requests.put(
+                url,
+                json={"reachable": True},
+                timeout=5
+            )
+    
+            response.raise_for_status()
+    
+            logging.info(
+                "CPE reachability reported to controller: cpe-id=%s",
+                cpe_id
+            )
+    
+            return True
+    
+        except Exception as e:
+            logging.warning(
+                "Failed to report CPE reachability to controller: %s",
+                e
+            )
+    
+            return False
+    # =====================================================================================
+    # Publish operations data in Datastore
+    # =====================================================================================
+    def detect_nat_type(self, wan_name, interface_name, role):
+        if role == "ipvpn":                                                       # NAT discovery is not needed for IP-VPN links
+            self.wan_nat_types.pop(wan_name, None)                                # remove any old NAT result
+            return None
+    
+        if not wan_name or not interface_name:                                    # both identifiers are required
+            return None
+    
+        try:
+            interface_state = self._get_forwarder_interface_state(interface_name) # read current live interface state
+            ipv4_address = interface_state.get("ipv4-address")                    # get current WAN IPv4
+    
+            if not ipv4_address:
+                logging.info(
+                    "Skipping NAT discovery for WAN %s because interface %s has no IPv4 address yet",
+                    wan_name,
+                    interface_name
+                )
+                return None                                                       # NAT discovery must wait until WAN has an address
+    
+            url = (
+                f"{self.forwarder_base_url}"
+                f"/api/v1/interfaces/{interface_name}/nat-discovery"
+            )                                                                     # Forwarder NAT discovery endpoint
+    
+            response = requests.post(
+                url,
+                json={},
+                timeout=10
+            )                                                                     # start asynchronous NAT discovery
+    
+            response.raise_for_status()                                           # raise error on HTTP failure
+    
+            task_id = response.json().get("task_id")                              # get NAT discovery task identifier
+    
+            if not task_id:
+                return None                                                       # cannot poll without task identifier
+    
+            result_url = (
+                f"{self.forwarder_base_url}"
+                f"/api/v1/interfaces/{interface_name}/nat-discovery/{task_id}"
+            )                                                                     # polling endpoint
+    
+            nat_type = None                                                       # NAT result not available yet
+    
+            for _ in range(5):
+                result = requests.get(
+                    result_url,
+                    headers={"Accept": "application/json"},
+                    timeout=10
+                )                                                                 # poll NAT discovery result
+    
+                result.raise_for_status()                                         # raise on HTTP failure
+                data = result.json()                                              # parse Forwarder response
+                status = data.get("status")                                       # running / completed / failed
+    
+                if status == "completed":
+                    nat_type = data.get("results", {}).get("nat_type")            # get final NAT type
+                    break
+    
+                if status == "failed":
+                    break                                                         # stop polling when discovery failed
+    
+                if status == "running":
+                    time.sleep(1)                                                 # wait before next poll
+    
+            if nat_type:
+                self.wan_nat_types[wan_name] = nat_type                           # update current runtime NAT state
+    
+                logging.info(
+                    "Updated NAT type=%s for WAN link=%s",
+                    nat_type,
+                    wan_name
+                )
+    
+            return nat_type
+    
+        except Exception as e:
+            logging.exception(
+                "NAT detection failed for WAN link %s: %s",
+                wan_name,
+                e
+            )
+    
+            return None
+
+    def discover_nat_for_all_wans(self):
+        current_config = self.config_reader.get_intended_config()                 # read all configured WAN links
+    
+        wan_links = self._as_list(
+            current_config.get("interfaces", {})
+                          .get("underlay", {})
+                          .get("wan-link", [])
+        )                                                                         # extract WAN-link list
+    
+        for wan in wan_links:
+            wan_name = wan.get("name")                                            # example: UPL1
+            interface_name = wan.get("interface-name")                            # example: ens7
+            role = wan.get("role")                                                # example: fiber
+            admin_enabled = self._bool_value(wan.get("admin-enabled"))            # check configured WAN state
+    
+            if not wan_name or not interface_name:
+                continue                                                          # skip incomplete configuration
+    
+            if admin_enabled is False:
+                continue                                                          # skip disabled WAN
+    
+            if role == "ipvpn":
+                self.wan_nat_types.pop(wan_name, None)                            # NAT discovery is not required for IP-VPN WAN
+                continue
+    
+            for _ in range(15):
+                interface_state = self._get_forwarder_interface_state(
+                    interface_name
+                )                                                                 # wait until WAN gets usable IP
+    
+                current_ipv4 = interface_state.get("ipv4-address")
+    
+                if current_ipv4:
+                    self.wan_last_ipv4[wan_name] = current_ipv4                  # establish initial IP baseline
+    
+                    self.detect_nat_type(
+                        wan_name,
+                        interface_name,
+                        role
+                    )                                                             # initial NAT discovery
+    
+                    break
+    
+                time.sleep(2)                                                     # DHCP may still be running
+            
+    def check_wan_ip_changes(self):
+        current_config = self.config_reader.get_intended_config()                 # read current WAN configuration
+    
+        wan_links = self._as_list(
+            current_config.get("interfaces", {})
+                          .get("underlay", {})
+                          .get("wan-link", [])
+        )                                                                         # get configured WAN links
+    
+        for wan in wan_links:
+            wan_name = wan.get("name")                                            # logical WAN name
+            interface_name = wan.get("interface-name")                            # Linux interface
+            role = wan.get("role")                                                # broadband/fiber/lte/ipvpn
+            admin_enabled = self._bool_value(wan.get("admin-enabled"))            # configured administrative state
+    
+            if not wan_name or not interface_name:
+                continue                                                          # skip incomplete WAN
+    
+            if admin_enabled is False:
+                continue                                                          # skip disabled WAN
+    
+            if role == "ipvpn":
+                continue                                                          # NAT discovery is not required for IP-VPN WAN
+    
+            interface_state = self._get_forwarder_interface_state(interface_name) # read live Forwarder state
+            current_ipv4 = interface_state.get("ipv4-address")                    # current effective WAN IP
+            previous_ipv4 = self.wan_last_ipv4.get(wan_name)                      # last observed WAN IP
+    
+            if current_ipv4 == previous_ipv4:
+                continue                                                          # nothing changed
+    
+            self.wan_last_ipv4[wan_name] = current_ipv4                           # remember latest state
+    
+            if current_ipv4 is None:
+                self.wan_nat_types.pop(wan_name, None)                            # old NAT result is no longer valid
+                continue                                                          # wait until WAN receives an address again
+    
+            logging.info(
+                "WAN IPv4 changed: wan=%s old=%s new=%s",
+                wan_name,
+                previous_ipv4,
+                current_ipv4
+            )
+    
+            self.detect_nat_type(
+                wan_name,
+                interface_name,
+                role
+            )                                                                      # rediscover NAT for the new WAN address
+    
+            self._announce_to_controller()                                        # trigger controller tunnel reconciliation
+        
+    def build_operational_state_xml(self):
+        current_config = self.current_config_cache                                        # use cached config to avoid recursive RESTCONF call
+        flow_state_map = self.latest_flow_state_map
+        tunnel_state_map = self.latest_tunnel_state_map
+
+        if not current_config:
+            return '<sdwan xmlns="urn:sdwan:cpe"/>'
+    
+        xml_parts = ['<sdwan xmlns="urn:sdwan:cpe">']                                      # start top-level sdwan tree
+    
+        # =================================================================================
+        # Tunnel operational information
+        # =================================================================================
+    
+        tunnels = self._as_list(
+            current_config.get("overlay", {}).get("tunnel", [])
+        )                                                                                 # get configured WireGuard tunnels
+    
+        if tunnels:
+            xml_parts.append("<overlay>")                                                  # open overlay container
+    
+            for tunnel in tunnels:
+                tunnel_name = tunnel.get("name")                                          # example: wg01
+    
+                if not tunnel_name:
+                    continue                                                              # skip invalid tunnel objects
+    
+                key_data = self.generated_tunnel_keys.get(tunnel_name, {})
+                public_key = key_data.get("public-key")
+                
+                # Operational-state publishing must never create new keys.
+                # Keys are created only when a tunnel is actually configured/reconciled.
+                if not public_key:
+                    public_path = f"/var/lib/clixon/local-public-keys/{tunnel_name}.pub"
+                
+                    if os.path.exists(public_path):
+                        try:
+                            with open(public_path, "r") as f:
+                                public_key = f.read().strip()
+                        except Exception as e:
+                            logging.warning(
+                                "Failed to read public key for tunnel %s: %s",
+                                tunnel_name,
+                                e
+                            )
+                            public_key = None
+                
+                if not public_key:
+                    continue
+    
+                xml_parts.append("<tunnel>")                                               # open tunnel list entry
+                xml_parts.append(
+                    f"<name>{escape(tunnel_name)}</name>"
+                )                                                                          # tunnel list key
+                xml_parts.append(
+                    f"<local-public-key>{escape(public_key)}</local-public-key>"
+                )                                                                          # config false local WireGuard public key
+                xml_parts.append("</tunnel>")                                              # close tunnel entry
+    
+            xml_parts.append("</overlay>")                                                 # close overlay container
+    
+        # =================================================================================
+        # WAN operational information
+        # =================================================================================
+    
+        xml_parts.append("<state>")                                                        # open config false operational-state container
+    
+        wan_links = self._as_list(
+            current_config.get("interfaces", {})
+                          .get("underlay", {})
+                          .get("wan-link", [])
+        )                                                                                  # read configured WAN links
+    
+        for wan in wan_links:
+            wan_name = wan.get("name")                                                     # example: UPL1
+            interface_name = wan.get("interface-name")                                     # example: ens7
+    
+            if not wan_name or not interface_name:
+                continue                                                                  # skip incomplete WAN object
+    
+            interface_state = self._get_forwarder_interface_state(interface_name)          # get live state from Forwarder
+    
+            ipv4_address = interface_state.get("ipv4-address")                             # current DHCP/static IPv4
+            oper_status = interface_state.get("oper-status")                               # current interface operational state
+            nat_type = self.wan_nat_types.get(wan_name)                                    # most recently discovered NAT type
+    
+            xml_parts.append("<wan-link-state>")                                           # create WAN operational-state list entry
+            xml_parts.append(
+                f"<name>{escape(wan_name)}</name>"
+            )                                                                              # mandatory wan-link-state key
+    
+            if oper_status:
+                xml_parts.append(
+                    f"<oper-status>{escape(oper_status)}</oper-status>"
+                )                                                                          # expose current WAN status
+    
+            if ipv4_address:
+                xml_parts.append(
+                    f"<ipv4-address>{escape(ipv4_address)}</ipv4-address>"
+                )                                                                          # expose current effective WAN IPv4
+    
+            if nat_type:
+                xml_parts.append(
+                    f"<nat-type>{escape(nat_type)}</nat-type>"
+                )                                                                          # expose latest runtime NAT discovery result
+    
+            xml_parts.append("</wan-link-state>")                                          # close WAN operational-state entry
+
+        # =================================================================================
+        # Per traffic-class / WAN-link monitoring state
+        # =================================================================================
+
+        for traffic_class, wan_states in flow_state_map.items():
+
+            for wan_name, metric_state in wan_states.items():
+
+                if not traffic_class or not wan_name:
+                    continue
+
+                xml_parts.append("<flow-state>")
+
+                xml_parts.append(
+                    f"<class>{escape(str(traffic_class))}</class>"
+                )
+
+                xml_parts.append(
+                    f"<wan-link>{escape(str(wan_name))}</wan-link>"
+                )
+
+                flow_id = metric_state.get("flow-id")
+                if flow_id is not None:
+                    xml_parts.append(
+                        f"<flow-id>{int(flow_id)}</flow-id>"
+                    )
+
+                oper_status = metric_state.get("oper-status")
+                if oper_status:
+                    xml_parts.append(
+                        f"<oper-status>{escape(str(oper_status))}</oper-status>"
+                    )
+
+                latency = metric_state.get("latency-ms")
+                if latency is not None:
+                    xml_parts.append(
+                        f"<latency-ms>{int(latency)}</latency-ms>"
+                    )
+
+                jitter = metric_state.get("jitter-ms")
+                if jitter is not None:
+                    xml_parts.append(
+                        f"<jitter-ms>{int(jitter)}</jitter-ms>"
+                    )
+
+                loss = metric_state.get("loss-percent")
+                if loss is not None:
+                    xml_parts.append(
+                        f"<loss-percent>{loss}</loss-percent>"
+                    )
+
+                bandwidth = metric_state.get("available-bandwidth-kbps")
+                if bandwidth is not None:
+                    xml_parts.append(
+                        f"<available-bandwidth-kbps>{int(bandwidth)}</available-bandwidth-kbps>"
+                    )
+
+                timestamp = metric_state.get("metric-timestamp")
+                if timestamp:
+                    xml_parts.append(
+                        f"<last-updated>{escape(str(timestamp))}</last-updated>"
+                    )
+
+                xml_parts.append("</flow-state>")
+
+        # =================================================================================
+        # Tunnel monitoring state
+        # =================================================================================
+
+        for tunnel_name, metric_state in tunnel_state_map.items():
+
+            if not tunnel_name:
+                continue
+
+            xml_parts.append("<tunnel-state>")
+
+            xml_parts.append(
+                f"<name>{escape(str(tunnel_name))}</name>"
+            )
+
+            oper_status = metric_state.get("oper-status")
+            if oper_status:
+                xml_parts.append(
+                    f"<oper-status>{escape(str(oper_status))}</oper-status>"
+                )
+
+            latency = metric_state.get("latency-ms")
+            if latency is not None:
+                xml_parts.append(
+                    f"<latency-ms>{int(latency)}</latency-ms>"
+                )
+
+            jitter = metric_state.get("jitter-ms")
+            if jitter is not None:
+                xml_parts.append(
+                    f"<jitter-ms>{int(jitter)}</jitter-ms>"
+                )
+
+            loss = metric_state.get("loss-percent")
+            if loss is not None:
+                xml_parts.append(
+                    f"<loss-percent>{loss}</loss-percent>"
+                )
+
+            bandwidth = metric_state.get("available-bandwidth-kbps")
+            if bandwidth is not None:
+                xml_parts.append(
+                    f"<available-bandwidth-kbps>{int(bandwidth)}</available-bandwidth-kbps>"
+                )
+
+            timestamp = metric_state.get("metric-timestamp")
+            if timestamp:
+                xml_parts.append(
+                    f"<last-updated>{escape(str(timestamp))}</last-updated>"
+                )
+
+            xml_parts.append("</tunnel-state>")
+
+        # =================================================================================
+        # Overall CPE operational state
+        # =================================================================================
+
+        cpe_state = self.latest_cpe_state
+
+        xml_parts.append("<cpe-state>")
+
+        oper_status = cpe_state.get("oper-status")
+        if oper_status:
+            xml_parts.append(
+                f"<oper-status>{escape(str(oper_status))}</oper-status>"
+            )
+
+        power_status = cpe_state.get("power-status")
+        if power_status:
+            xml_parts.append(
+                f"<power-status>{escape(str(power_status))}</power-status>"
+            )
+
+        forwarder_status = cpe_state.get("forwarder-status")
+        if forwarder_status:
+            xml_parts.append(
+                f"<forwarder-status>{escape(str(forwarder_status))}</forwarder-status>"
+            )
+
+        forwarder_version = cpe_state.get("forwarder-version")
+        if forwarder_version:
+            xml_parts.append(
+                f"<forwarder-version>{escape(str(forwarder_version))}</forwarder-version>"
+            )
+
+        uptime = cpe_state.get("uptime-seconds")
+        if uptime is not None:
+            xml_parts.append(
+                f"<uptime-seconds>{int(uptime)}</uptime-seconds>"
+            )
+
+        last_seen = cpe_state.get("last-seen")
+        if last_seen:
+            xml_parts.append(
+                f"<last-seen>{escape(str(last_seen))}</last-seen>"
+            )
+
+        status_reason = cpe_state.get("status-reason")
+        if status_reason:
+            xml_parts.append(
+                f"<status-reason>{escape(str(status_reason))}</status-reason>"
+            )
+
+        xml_parts.append("</cpe-state>")
+    
+        xml_parts.append("</state>")                                                       # close operational-state container
+        xml_parts.append("</sdwan>")                                                       # close top-level YANG container
+    
+        return "".join(xml_parts)                                                          # return complete XML to internal state API
+        
+    # =====================================================================================
+    # Check RESTCONF Server status before running Steering Loop
+    # =====================================================================================
+    def wait_for_restconf(self, timeout_sec=60):
+        start_time = time.time()
+
+        while time.time() - start_time < timeout_sec:
+            try:
+                self.config_reader.get_intended_config()
+                logging.info("RESTCONF is ready for steering loop")
+                return True
+            except Exception:
+                logging.info("Waiting for RESTCONF before starting steering loop")
+                time.sleep(2)
+
+        logging.warning("RESTCONF was not ready within timeout")
+        return False
+
+    def run_steering_loop_after_restconf_ready(self, interval_sec=10):
+        if not self.wait_for_restconf():                                                # wait until Clixon RESTCONF is ready
+            return
+    
+        self.current_config_cache = self.config_reader.get_intended_config()            # populate cache once at startup
+    
+        logging.info("Waiting for startup reconciliation before steering loop")
+    
+        # Normally transaction-id 0 triggers reconciliation.
+        # Timeout prevents the Agent from being permanently blocked
+        
+        reconciliation_triggered = self.startup_reconcile_event.wait(timeout=10)         
+    
+        if not reconciliation_triggered:
+            logging.warning( "No Clixon transaction 0 reconciliation received; "        # if Clixon does not deliver transaction 0 for some reason.
+                "running startup reconciliation as fallback"
+            )
+    
+            self.startup_reconcile_started = True
+            self.reconcile_startup_state()
+    
+        if not self.startup_reconciled:
+            logging.error("Startup reconciliation did not complete successfully; " "runtime steering loop will not start")
+            return
+            
+        logging.info("Startup recovery finished; starting runtime steering loop")
+
+        self.run_forever(interval_sec=interval_sec)
+        
+    # =====================================================================================
+    # Forwarder API helpers
+    # =====================================================================================
+    def _operation(self, method, path, payload=None):
+        operation = {"method": method, "path": path}                                     # basic forwarder operation structure
+        if payload is not None:
+            operation["payload"] = payload                                               # payload is added only when the operation needs data
+        return operation
+
+    def _store_forwarder_fwmark(self, traffic_class, fwmark):
+        if not traffic_class or fwmark is None:                                          # do nothing if required values are missing
+            return
+    
+        self.flow_id_fwmarks[traffic_class] = int(fwmark)                                # store fwmark learned from forwarder for monitoring use
+        logging.info("Learned fwmark=%s for traffic_class=%s from forwarder", fwmark, traffic_class) # log learned fwmark
+
+    def _assign_temporary_fake_fwmark(self, traffic_class):                               # REMOVE THIS FUNCTION ONCE FWMARK CREATION IS READY IN FORWARDER
+        if not traffic_class:
+            return None
+    
+        if traffic_class in self.flow_id_fwmarks:
+            return self.flow_id_fwmarks[traffic_class]
+    
+        fake_fwmark = 1000 + len(self.flow_id_fwmarks) + 1
+    
+        self.flow_id_fwmarks[traffic_class] = fake_fwmark
+    
+        logging.warning(
+            "Temporary fake fwmark=%s assigned for traffic_class=%s because forwarder did not return fwmark yet",
+            fake_fwmark,
+            traffic_class)
+
+        return fake_fwmark
+
+    def _process_forwarder_transaction_result(self, result):
+        if not isinstance(result, dict):                                                  # ignore unexpected response format
+            return
+    
+        for operation_result in result.get("results", []):                                # loop through each operation result returned by forwarder
+            path = operation_result.get("path", "")
+            fwmark = operation_result.get("fwmark")
+    
+            if not path.startswith("/api/v1/flow-policies/traffic-class-"):               # only flow-policy responses are expected to contain fwmark
+                continue
+    
+            traffic_class = path.rsplit("traffic-class-", 1)[-1]                          # extract traffic class name from flow policy path
+    
+            if fwmark is not None:
+                self._store_forwarder_fwmark(traffic_class, fwmark)                       # normal final behavior
+            else:
+                self._assign_temporary_fake_fwmark(traffic_class)                         # temporary behavior until forwarder returns fwmark
+
+    def _sync_fwmarks_from_forwarder(self):
+        if self.forwarder_dry_run:                                                        # skip forwarder recovery when forwarder API calls are disabled
+            logging.info("Dry-run: skipping fwmark sync from forwarder")                  # log why sync is skipped
+            return                                                                        # stop here in dry-run mode
+    
+        try:                                                                              # protect startup from forwarder/API errors
+            current_config = self.config_reader.get_intended_config()                     # read current intended config from YANG datastore
+    
+            configured_classes = set()                                                    # stores traffic classes currently configured in YANG
+    
+            classes = self._as_list(                                                      # read configured traffic classes from datastore
+                current_config.get("traffic", {}).get("class", [])
+            )
+    
+            for traffic_class_obj in classes:                                             # loop through each configured traffic class
+                class_name = traffic_class_obj.get("name")                                # read traffic class name
+    
+                if class_name:                                                            # only store valid class names
+                    configured_classes.add(class_name)                                    # example: video, web
+    
+            url = f"{self.forwarder_base_url}/api/v1/flow-policies"                       # bulk GET to recover all stored forwarder flow policies after restart
+    
+            response = requests.get(                                                      # ask forwarder for all flow policies in one call
+                url,
+                headers={"Accept": "application/json"},
+                timeout=10
+            )
+    
+            if response.status_code == 404:                                                # forwarder does not support bulk GET yet
+                logging.warning(
+                    "Forwarder does not support GET /api/v1/flow-policies yet; "
+                    "temporary fake fwmarks will be assigned when needed"
+                )
+                return                                                                    # continue agent startup without recovered fwmarks
+    
+            response.raise_for_status()                                                   # raise error for other HTTP failures
+    
+            data = response.json()                                                        # parse forwarder JSON response body
+    
+            flow_policies = data.get("items", data.get("flow_policies", []))              # expected list of stored flow policies
+    
+            for policy in flow_policies:                                                  # loop through each flow policy returned by forwarder
+                policy_id = (                                                             # accept possible naming variations from forwarder
+                    policy.get("policy_id")
+                    or policy.get("id")
+                    or policy.get("name")
+                )
+    
+                fwmark = policy.get("fwmark")                                             # read fwmark stored by forwarder for this flow policy
+    
+                if not policy_id:                                                         # skip invalid entries without policy id
+                    continue
+    
+                if not policy_id.startswith("traffic-class-"):                            # agent only needs traffic-class flow policies
+                    continue
+    
+                traffic_class = policy_id.replace("traffic-class-", "", 1)                # convert traffic-class-video into video
+    
+                if traffic_class not in configured_classes:                               # ignore stale forwarder policies not present in current YANG config
+                    logging.info(
+                        "Ignoring forwarder flow-policy=%s because traffic_class=%s is not in datastore",
+                        policy_id,
+                        traffic_class
+                    )
+                    continue
+    
+                if fwmark is None:                                                        # forwarder returned policy but no fwmark
+                    logging.warning(
+                        "Forwarder flow-policy=%s has no fwmark",
+                        policy_id
+                    )
+                    continue                                                              # temporary fake fwmark logic will handle this later
+    
+                self._store_forwarder_fwmark(traffic_class, fwmark)                       # store recovered fwmark in runtime cache
+    
+            logging.info("Fwmark cache after startup sync: %s", self.flow_id_fwmarks)     # show final recovered cache
+    
+        except Exception as e:                                                            # catch connection, timeout, JSON, or other errors
+            logging.exception("Failed to sync fwmarks from forwarder: %s", e)             # do not stop agent if startup recovery fails
+    
+    def _send_forwarder_transaction(self, operations, validate_only, timeout=10):
+        payload = {
+            "validate_only": validate_only,                                              # "True" during Clixon validate phase, "False" during commit phase. Detection happens in happens in handle_clixon_transaction()
+            "operations": operations}                                                    # all forwarder operations are sent as one transaction
+
+        print("\n===== FORWARDER TRANSACTION GENERATED =====")
+        print(json.dumps(payload, indent=2))
+
+        if self.forwarder_dry_run:                                                        #in dry-run mode, only print the transaction without calling forwarder
+            return {
+                "status": "dry-run",
+                "message": "Forwarder is not called because it's not available",
+                "payload": payload}
+
+        url = f"{self.forwarder_base_url}/api/v1/transactions"
+        response = requests.post(url, json=payload, timeout=timeout)                            #send the transaction to the forwarder API
+        response.raise_for_status()
+
+        logging.info("Forwarder response body: %s", response.text)                         # log actual response body for debugging
+        
+        if response.text:
+            result = response.json()
+            if result.get("status") == "rejected":
+                logging.error("Forwarder rejected transaction: %s", response.text)
+        
+                raise RuntimeError(f"Forwarder rejected transaction: {result}" )
+            self._process_forwarder_transaction_result(result)
+            return result
+        
+        return {"status": "ok"}                                                            # return simple OK if response body is empty
+
+    # =====================================================================================
+    # Build forwarder operations (for Clixon YANG Datastore config-diff triggered operations)
+    # =====================================================================================
+    def _build_wan_link_operations(self, parent_dict, changed_leafs, delete=False):
+        name = parent_dict.get("name")
+        route_set_id = f"{name}-default"
+        interface_name = parent_dict.get("interface-name")
+        role = parent_dict.get("role")
+        admin_enabled = self._bool_value(parent_dict.get("admin-enabled"))
+        address_mode = parent_dict.get("address-mode")
+        static_address = parent_dict.get("static-address")
+        static_gateway = parent_dict.get("static-gateway")
+
+        if isinstance(changed_leafs, str):
+            changed_leafs = [changed_leafs]                                               #allows the function to accept either one leaf or a list of leaves
+
+        if not interface_name:
+            logging.warning("WAN link %s has no interface-name", name)
+            return []
+
+        operations = []                                                                   #stores the forwarder operations generated for this object
+
+        if delete:
+            operations.append(self._operation("DELETE", f"/api/v1/interfaces/{interface_name}/configuration") )     # Complete removal of Forwarder managed WAN configuration.
+            return operations
+
+        if self._has_change(changed_leafs, "admin-enabled") and admin_enabled is not None:
+            operations.append(
+                self._operation("PUT", f"/api/v1/interfaces/{interface_name}/state",
+                                {"state": "up" if admin_enabled else "down"}))
+
+        if self._has_change(changed_leafs, "static-address", "address-mode", "interface-name"):
+            addresses = []
+            if address_mode == "static" and static_address:
+                addresses.append(static_address)
+            operations.append(self._operation("PUT", f"/api/v1/interfaces/{interface_name}/addresses", {"addresses": addresses}))
+
+        if self._has_change(changed_leafs, "static-gateway", "address-mode", "interface-name"):
+            if address_mode == "static" and static_gateway:
+                operations.append(self._operation("PUT", f"/api/v1/routes/static/{route_set_id}", {
+                    "routes": [{
+                        "destination_cidr": "0.0.0.0/0",
+                        "next_hop_ip": static_gateway,
+                        "out_interface": interface_name
+                    }]
+                }))
+            elif address_mode == "dhcp":
+                operations.append(self._operation("DELETE", f"/api/v1/routes/static/{route_set_id}"))
+
+        return operations
+
+    def _build_lan_link_operations(self, parent_dict, changed_leafs, delete=False):
+        name = parent_dict.get("name")
+        bridge_id = parent_dict.get("bridge-name")                                           # YANG bridge-name is used as Forwarder bridge_id
+        target_interface = bridge_id if bridge_id else name
+        member_interfaces = self._as_list(parent_dict.get("member-interface"))
+        ipv4_prefix = parent_dict.get("ipv4-prefix")
+        admin_enabled = self._bool_value(parent_dict.get("admin-enabled"))
+        dhcp_server = parent_dict.get("dhcp-server", {})
+    
+        if isinstance(changed_leafs, str):
+            changed_leafs = [changed_leafs]                                                   # allows the function to accept either one leaf or a list of leaves
+    
+        if not target_interface:
+            logging.warning("LAN link has no interface name")
+            return []
+    
+        operations = []                                                                       # stores the forwarder operations generated for this object
+    
+        if delete:
+            if bridge_id:
+                operations.append(self._operation("DELETE", f"/api/v1/bridges/{bridge_id}"))
+            else:
+                operations.append(self._operation("PUT", f"/api/v1/interfaces/{target_interface}/state", {"state": "down"}))
+            operations.append(self._operation("DELETE", f"/api/v1/services/dhcp/{target_interface}"))
+            return operations
+    
+        if bridge_id and self._has_change(changed_leafs, "name", "bridge-name", "admin-enabled"):
+            bridge_payload = {"bridge_id": bridge_id}                                        # OpenAPI bridge payload requires bridge_id
+            if self._has_change(changed_leafs, "admin-enabled") and admin_enabled is not None:
+                bridge_payload["admin_state"] = "up" if admin_enabled else "down"
+    
+            operations.append(self._operation("PUT", f"/api/v1/bridges/{bridge_id}", bridge_payload))
+    
+        if bridge_id and self._has_change(changed_leafs, "member-interface"):
+            operations.append(
+                self._operation("PUT", f"/api/v1/bridges/{bridge_id}/members",
+                                {"interfaces": member_interfaces}))
+    
+            for member in member_interfaces:
+                operations.append(self._operation("PUT", f"/api/v1/interfaces/{member}/state", {"state": "up"}))
+    
+        if not bridge_id and self._has_change(changed_leafs, "admin-enabled") and admin_enabled is not None:
+            operations.append(
+                self._operation("PUT", f"/api/v1/interfaces/{target_interface}/state",
+                                {"state": "up" if admin_enabled else "down"}))
+    
+        if self._has_change(changed_leafs, "ipv4-prefix", "bridge-name"):
+            operations.append(
+                self._operation("PUT", f"/api/v1/interfaces/{target_interface}/addresses",
+                                {"addresses": [ipv4_prefix] if ipv4_prefix else []}))
+    
+        if self._has_change(changed_leafs, "enabled", "pool-start", "pool-end", "dns-server", "lease-time-seconds", "ipv4-prefix", "bridge-name"):
+            dhcp_enabled = self._bool_value(dhcp_server.get("enabled"))
+            dhcp_payload = {
+                "enabled": dhcp_enabled,
+                "served_interface": target_interface
+            }
+            self._add_if_not_none(dhcp_payload, "range_start", dhcp_server.get("pool-start"))
+            self._add_if_not_none(dhcp_payload, "range_end", dhcp_server.get("pool-end"))
+            self._add_if_not_none(dhcp_payload, "gateway", self._ip_from_prefix(ipv4_prefix))
+            dns_servers = self._as_list(dhcp_server.get("dns-server"))
+            if dns_servers:
+                dhcp_payload["dns_servers"] = dns_servers
+            self._add_if_not_none(dhcp_payload, "lease_time", self._lease_time(dhcp_server.get("lease-time-seconds")))
+    
+            if dhcp_enabled is False:
+                operations.append(self._operation("DELETE", f"/api/v1/services/dhcp/{target_interface}"))
+            elif dhcp_enabled is True:
+                operations.append(self._operation("PUT", f"/api/v1/services/dhcp/{target_interface}", dhcp_payload))
+    
+        return operations
+
+    def _build_tunnel_operations(self, parent_dict, changed_leafs, delete=False):
+        tunnel_id = parent_dict.get("name")                                                                         # YANG tunnel/name is used as Forwarder tunnel_id
+    
+        if isinstance(changed_leafs, str):
+            changed_leafs = [changed_leafs]                                                                         # allows the function to accept either one leaf or a list of leaves
+    
+        if not tunnel_id:
+            logging.warning("Tunnel has no name")
+            return []
+    
+        if delete:
+            return [self._operation("DELETE",  f"/api/v1/routes/static/{tunnel_id}-peer-routes"),
+                    self._operation("DELETE", f"/api/v1/tunnels/wireguard/{tunnel_id}" )]
+    
+        if tunnel_id not in self.generated_tunnel_keys:
+            private_key, public_key, private_path = self._generate_wireguard_tunnel_keys(tunnel_id)
+            if private_key and public_key:
+                self.generated_tunnel_keys[tunnel_id] = {
+                    "private-key": private_key,
+                    "public-key": public_key,
+                    "private-path": private_path}
+    
+        operations = []                                                                                          # stores the forwarder operations generated for this object
+    
+        admin_enabled = self._bool_value(parent_dict.get("admin-enabled"))
+        if self._has_change(changed_leafs, "admin-enabled") and admin_enabled is False:
+            operations.append(self._operation("DELETE", f"/api/v1/routes/static/{tunnel_id}-peer-routes"))
+            operations.append(self._operation("DELETE", f"/api/v1/tunnels/wireguard/{tunnel_id}"))
+            return operations
+    
+        tunnel_change_leafs = ["name", "local-port", "local-address", "mtu", "admin-enabled"]
+        
+        if self._has_change(changed_leafs, *tunnel_change_leafs):
+            local_port = parent_dict.get("local-port")
+            local_address = parent_dict.get("local-address")
+            mtu = parent_dict.get("mtu")
+        
+            private_path = self.generated_tunnel_keys.get(tunnel_id, {}).get("private-path")
+        
+            tunnel_payload = {}
+        
+            if private_path:
+                tunnel_payload["private_key_ref"] = f"file://{private_path}"
+        
+            self._add_if_not_none(tunnel_payload,"listen_port", int(local_port) if local_port else None)
+        
+            tunnel_payload["local_addresses"] = ([local_address] if local_address else [])
+        
+            self._add_if_not_none(tunnel_payload, "mtu", int(mtu) if mtu else None)
+        
+            tunnel_payload["description"] = (f"WireGuard tunnel {tunnel_id}" )
+        
+            if ("listen_port" in tunnel_payload and tunnel_payload["local_addresses"]):
+                operations.append(self._operation("PUT", f"/api/v1/tunnels/wireguard/{tunnel_id}", tunnel_payload))
+    
+        peer_change_leafs = ["peer-address", "peer-port", "peer-public-key", "allowed-prefix", "keepalive-seconds", "resolved-peer", "admin-enabled"]
+        if self._has_change(changed_leafs, *peer_change_leafs):
+            peer_operation = self._build_wireguard_peer_operation(parent_dict)
+            if peer_operation:
+                operations.append(peer_operation)
+
+            resolved_peer = parent_dict.get("resolved-peer", {})
+            allowed_prefixes = []
+
+            for prefix in self._as_list(resolved_peer.get("allowed-prefix")):
+                try:
+                    allowed_prefixes.append(str(ipaddress.ip_network(prefix, strict=False)))
+                except ValueError:
+                    logging.warning("Ignoring invalid WireGuard allowed-prefix: %s", prefix)
+    
+            if allowed_prefixes:
+                route_payload = { "routes": [] }
+        
+                for prefix in allowed_prefixes:
+                    route_payload["routes"].append({
+                        "destination_cidr": prefix,
+                        "out_interface": tunnel_id   })
+        
+                operations.append(
+                    self._operation( "PUT",  f"/api/v1/routes/static/{tunnel_id}-peer-routes", route_payload ))     #Install remote prefixes through this WireGuard tunnel
+        return operations
+
+    def _build_wireguard_peer_operation(self, tunnel):
+        name = tunnel.get("name")
+        resolved_peer = tunnel.get("resolved-peer", {})                                #peer details are nested under resolved-peer in the YANG model
+        if not name or not resolved_peer:
+            return None
+
+        peer_id = tunnel.get("remote-cpe-id") or f"{name}-peer"
+        peer_address = resolved_peer.get("peer-address")
+        peer_port = resolved_peer.get("peer-port")
+        peer_public_key = resolved_peer.get("peer-public-key")
+        allowed_prefixes = []
+        for prefix in self._as_list(resolved_peer.get("allowed-prefix")):
+            try:
+                allowed_prefixes.append(str(ipaddress.ip_network(prefix, strict=False)))
+            except ValueError:
+                logging.warning("Ignoring invalid WireGuard allowed-prefix: %s", prefix )
+        keepalive = tunnel.get("keepalive-seconds")
+
+        peer_payload = {}
+        self._add_if_not_none(peer_payload, "public_key", peer_public_key)
+        peer_payload["allowed_ips"] = allowed_prefixes
+        if peer_address and peer_port:
+            peer_payload["endpoint"] = f"{peer_address}:{peer_port}"
+        self._add_if_not_none(peer_payload, "persistent_keepalive", int(keepalive) if keepalive else None)
+        peer_payload["description"] = f"Peer {peer_id} for tunnel {name}"
+
+        if "public_key" not in peer_payload or "allowed_ips" not in peer_payload:
+            return None
+
+        return self._operation("PUT", f"/api/v1/tunnels/wireguard/{name}/peers/{peer_id}", peer_payload)
+
+    def _build_firewall_rule_operations(self, parent_dict, changed_leafs, delete=False):
+        rule_id = parent_dict.get("id")
+    
+        if isinstance(changed_leafs, str):
+            changed_leafs = [changed_leafs]
+    
+        if not rule_id:
+            logging.warning("Firewall rule has no id")
+            return []
+    
+        if delete:
+            return [self._operation("DELETE", f"/api/v1/firewall/rules/{rule_id}")]
+    
+        match = self._build_match_from_dict(parent_dict)
+        action = parent_dict.get("action")
+    
+        firewall_payload = {
+            "rule_id": rule_id,
+            "action": action,
+            "match": match,
+            "log": self._bool_value(parent_dict.get("log")),
+            "description": f"Firewall {action} rule {rule_id}"}
+    
+        self._add_if_not_none(
+            firewall_payload,
+            "priority",
+            int(parent_dict.get("priority")) if parent_dict.get("priority") else None )
+    
+        return [self._operation("PUT", f"/api/v1/firewall/rules/{rule_id}", firewall_payload)]
+
+    def _build_traffic_class_operations(self, parent_dict, changed_leafs, delete=False):
+        class_name = parent_dict.get("name")
+        five_tuple = parent_dict.get("five-tuple", {})
+    
+        if isinstance(changed_leafs, str):
+            changed_leafs = [changed_leafs]                                                   # allows the function to accept either one leaf or a list of leaves
+    
+        if not class_name:
+            logging.warning("Traffic class has no name")
+            return []
+    
+        policy_id = f"traffic-class-{class_name}"
+    
+        if delete:
+            return [self._operation("DELETE", f"/api/v1/flow-policies/{policy_id}")]
+    
+        match = {}
+        self._add_if_not_none(match, "src_prefix", five_tuple.get("src-prefix"))
+        self._add_if_not_none(match, "dst_prefix", five_tuple.get("dst-prefix"))
+    
+        protocol = five_tuple.get("l4-protocol")
+        if protocol and protocol != "any":
+            match["protocol"] = protocol
+    
+        src_ports = self._port_range(five_tuple.get("src-port"))
+        if src_ports:
+            match["src_ports"] = src_ports
+    
+        dst_ports = self._port_range(five_tuple.get("dst-port"))
+        if dst_ports:
+            match["dst_ports"] = dst_ports
+    
+        if not match:
+            logging.warning("Traffic class %s has no five-tuple match", class_name)
+            return []
+    
+        payload = {
+            "match": match,
+            "description": f"Traffic class {class_name} classification policy"
+        }
+    
+        return [self._operation("PUT", f"/api/v1/flow-policies/{policy_id}", payload)]
+
+    def _build_match_from_dict(self, parent_dict):
+        match = {}                                                                         #traffic match fields such as prefixes, ports and protocol
+        self._add_if_not_none(match, "src_prefix", parent_dict.get("src-prefix"))
+        self._add_if_not_none(match, "dst_prefix", parent_dict.get("dst-prefix"))
+        self._add_if_not_none(match, "in_interface", parent_dict.get("in-interface"))
+        self._add_if_not_none(match, "out_interface",parent_dict.get("out-interface"))
+
+        protocol = parent_dict.get("l4-protocol")
+        if protocol:
+            match["protocol"] = protocol
+
+        src_ports = self._port_range(parent_dict.get("src-port"))
+        if src_ports:
+            match["src_ports"] = src_ports
+
+        dst_ports = self._port_range(parent_dict.get("dst-port"))
+        if dst_ports:
+            match["dst_ports"] = dst_ports
+
+        return match
+
+    def _build_operations_from_object(self, object_type, parent_dict, changed_leafs, delete=False):
+
+        if object_type == "wan-link":
+            return self._build_wan_link_operations(
+                parent_dict,
+                changed_leafs,
+                delete   )                                                                                       # direct WAN-link object
+    
+        if object_type == "underlay":
+            operations = []                                                                         # stores operations from all WAN links inside underlay
+    
+            for wan_link in self._as_list(parent_dict.get("wan-link")):                             # loop through WAN links inside underlay
+                if not isinstance(wan_link, dict):
+                    continue                                                                        # skip invalid WAN-link objects
+    
+                operations.extend(
+                    self._build_wan_link_operations(
+                        wan_link,
+                        changed_leafs,
+                        delete
+                    )
+                )                                                                                   # build Forwarder operations for each WAN link
+    
+            return operations                                                                       # return all generated WAN operations
+    
+        if object_type == "interfaces":
+            operations = []                                                                         # stores operations from nested WAN/LAN objects
+    
+            underlay = parent_dict.get("underlay") or {}                                             # get underlay container safely
+    
+            for wan_link in self._as_list(underlay.get("wan-link")):                                 # loop through WAN links inside interfaces/underlay
+                if not isinstance(wan_link, dict):
+                    continue                                                                         # skip invalid WAN-link objects
+    
+                operations.extend(
+                    self._build_wan_link_operations(
+                        wan_link,
+                        changed_leafs,
+                        delete
+                    )
+                )                                                                                   # build Forwarder operations for nested WAN link
+    
+            lan = parent_dict.get("lan") or {}                                                       # get LAN container safely
+    
+            for lan_link in self._as_list(lan.get("lan-link")):                                      # loop through LAN links inside interfaces/lan
+                if not isinstance(lan_link, dict):
+                    continue                                                                         # skip invalid LAN-link objects
+    
+                operations.extend(
+                    self._build_lan_link_operations(
+                        lan_link,
+                        changed_leafs,
+                        delete
+                    )
+                )                                                                                    # build Forwarder operations for nested LAN link
+    
+            return operations                                                                        # return all WAN/LAN operations
+    
+        if object_type == "lan-link":
+            return self._build_lan_link_operations(
+                parent_dict,
+                changed_leafs,
+                delete
+            )                                                                                        # direct LAN-link object
+    
+        if object_type == "lan":
+            operations = []                                                                          # stores operations from all LAN links inside lan container
+    
+            for lan_link in self._as_list(parent_dict.get("lan-link")):                              # loop through LAN links
+                if not isinstance(lan_link, dict):
+                    continue                                                                         # skip invalid LAN-link objects
+    
+                operations.extend(
+                    self._build_lan_link_operations(
+                        lan_link,
+                        changed_leafs,
+                        delete
+                    )
+                )                                                                                   # build Forwarder operations for each LAN link
+    
+            return operations                                                                       # return all generated LAN operations
+
+        if object_type == "overlay":
+            operations = []
+
+            for tunnel in self._as_list(parent_dict.get("tunnel")):
+                if not isinstance(tunnel, dict):
+                    continue
+
+                operations.extend(
+                    self._build_tunnel_operations(
+                        tunnel,
+                        changed_leafs,
+                        delete
+                    )
+                )
+
+            return operations
+            
+        if object_type == "tunnel":
+            return self._build_tunnel_operations(
+                parent_dict,
+                changed_leafs,
+                delete
+            )                                                                                       # WireGuard tunnel object
+    
+        if object_type == "rule":
+            return self._build_firewall_rule_operations(
+                parent_dict,
+                changed_leafs,
+                delete
+            )                                                                                       # firewall rule object
+    
+        if object_type == "class":
+            return self._build_traffic_class_operations(
+                parent_dict,
+                changed_leafs,
+                delete
+            )                                                                                       # traffic class object
+    
+        logging.info(
+            "No forwarder mapping yet for object type=%s, changed_leafs=%s",
+            object_type,
+            changed_leafs
+        )                                                                                           # log unsupported object type
+    
+        return []                                                                                   # no Forwarder operation for unsupported object
+
+    def _build_operations_from_parent_xml(self, parent_xml, changed_leafs, delete=False):
+        if parent_xml is None:
+            return []
+
+        object_type = self._local_name(parent_xml.tag)
+        parent_dict = self._xml_to_dict(parent_xml)
+
+        return self._build_operations_from_object(object_type, parent_dict, changed_leafs, delete)
+
+    # =====================================================================================
+    # Monitoring manager helper
+    # =====================================================================================
+    def _start_monitoring_for_object(self, object_type, parent_dict):                      # called after Clixon commit to start/update monitoring
+        if not hasattr(self, "monitoring_manager"):                                        # check whether MonitoringManager is enabled
+            logging.warning("monitoring_manager not configured")                           # log missing monitoring manager
+            return                                                                         # stop without failing agent
+    
+        try:                                                                               # protect Clixon callback from monitoring errors
+            if object_type == "class":                                                     # traffic class object changed
+                class_name = parent_dict.get("name")                                       # read traffic class name
+    
+                if not class_name:                                                         # traffic class name is required
+                    logging.warning("Cannot start monitoring: traffic class has no name")   # log missing class name
+                    return                                                                 # stop this monitoring action
+    
+                current_config = self.current_config_cache          
+                policies = current_config.get("policy", {}).get("steering", [])           # read steering policies
+    
+                for policy in self._as_list(policies):                                     # loop through steering policies
+                    if policy.get("class") != class_name:                                  # skip policies for other traffic classes
+                        continue                                                           # continue searching
+    
+                    uses_wan_link = (                                                      # check whether this traffic class uses underlay WAN links
+                        policy.get("failover-link-type") == "wan-link"
+                        or policy.get("load-balance-link-type") == "wan-link")
+    
+                    if not uses_wan_link:                                      
+                        logging.info("Skipping flow monitoring for class=%s because it uses tunnel steering", class_name )
+                        return                                                             # stop after matching policy is processed
+    
+                    flow_id = self.flow_id_fwmarks.get(class_name)                         # get real fwmark from forwarder result
+    
+                    if flow_id is None:                                                    # if forwarder has not returned fwmark yet
+                        flow_id = self._assign_temporary_fake_fwmark(class_name)            # use temporary fake fwmark for monitoring
+    
+                    wan_names = []                                                         # list of WAN candidates used by this policy
+    
+                    if policy.get("primary-wan-link"):                                     # include primary WAN if configured
+                        wan_names.append(policy.get("primary-wan-link"))                   # add primary WAN
+    
+                    wan_names.extend(self._as_list(policy.get("secondary-wan-link")))      # add failover secondary WANs
+                    wan_names.extend(self._as_list(policy.get("load-balance-wan-link")))   # add load-balance WANs
+    
+                    seen_wan_names = set()                                                 # avoid duplicate monitoring requests
+    
+                    for wan_name in wan_names:                                             # start one monitor per WAN candidate
+                        if not wan_name or wan_name in seen_wan_names:                     # skip empty or duplicate names
+                            continue                                                       # continue to next WAN
+    
+                        seen_wan_names.add(wan_name)                                       # remember this WAN was already processed
+    
+                        payload = self.monitoring_manager.start_underlay_flow_monitoring(   # call monitoring manager for this flow over this WAN
+                            traffic_class=parent_dict,                                     # traffic class contains five-tuple
+                            steering_policy=policy,                                        # steering policy contains SLO values
+                            flow_id=flow_id,                                                # flow_id is fwmark in final logic
+                            wan_link_name=wan_name                                          # candidate WAN link used for this probe
+                        )
+    
+                        logging.info(                                                      
+                            "Started underlay monitoring for class=%s wan_link=%s payload=%s",class_name, wan_name, payload)
+                    return                                                                
+    
+                logging.info("Skipping monitoring for class=%s because no steering policy exists", class_name) # no matching policy found
+    
+            elif object_type == "tunnel":                                                   # tunnel object changed
+                payload = self.monitoring_manager.start_overlay_tunnel_monitoring(parent_dict) # call monitoring manager for overlay tunnel monitoring
+                logging.info("Started overlay tunnel monitoring payload=%s", payload)        # log successful tunnel monitoring request
+    
+        except Exception as e:                                                            
+            logging.exception(                                                          
+                "Failed to start monitoring for object_type=%s object=%s: %s",object_type, parent_dict, e)
+            
+    def _stop_monitoring_for_object(self, object_type, parent_dict):                      # called after Clixon commit to stop monitoring
+        if not hasattr(self, "monitoring_manager"):                                       # check whether MonitoringManager is enabled
+            logging.warning("monitoring_manager not configured")                          # log warning if not enabled
+            return                                                                        # stop without failing agent
+
+        try:                                                                              # protect Clixon callback from monitoring errors
+            if object_type == "class":                                                              # traffic class deleted
+                class_name = parent_dict.get("name")                                                # read traffic class name
+            
+                if not class_name:                                                                  # class name is required
+                    logging.warning("Cannot stop monitoring: traffic class has no name")            # log missing class name
+                    return                                                                          # stop this monitoring action
+            
+                flow_id = self.flow_id_fwmarks.get(class_name)                                      # get fwmark/flow_id for this class
+            
+                if flow_id is None:                                                                 # if forwarder has not returned fwmark yet
+                    flow_id = self._assign_temporary_fake_fwmark(class_name)                        # use temporary fake fwmark
+            
+                current_config = self.current_config_cache
+                policies = current_config.get("policy", {}).get("steering", [])                    # read steering policies
+            
+                for policy in self._as_list(policies):                                              # loop through steering policies
+                    if policy.get("class") != class_name:                                           # skip other traffic classes
+                        continue                                                                    # continue to next policy
+            
+                    wan_names = []                                                                  # collect WAN links for this traffic class
+            
+                    if policy.get("primary-wan-link"):                                              # failover primary WAN
+                        wan_names.append(policy.get("primary-wan-link"))                            # add primary WAN
+            
+                    wan_names.extend(self._as_list(policy.get("secondary-wan-link")))               # add secondary WANs
+                    wan_names.extend(self._as_list(policy.get("load-balance-wan-link")))            # add load-balance WANs
+            
+                    for wan_name in set(wan_names):                                                 # remove duplicates and loop
+                        if wan_name:                                                                # skip empty values
+                            self.monitoring_manager.stop_underlay_flow_monitoring(flow_id, wan_name) # stop monitor for flow_id + WAN link
+            
+                self.flow_id_fwmarks.pop(class_name, None)                                          # remove cached fwmark after class deletion
+            
+                logging.info(                                                                       # log successful stop handling
+                    "Stopped underlay monitoring for class=%s flow_id=%s",
+                    class_name,
+                    flow_id
+                )
+
+            elif object_type == "tunnel":                                                  # tunnel deleted
+                tunnel_id = parent_dict.get("name")                                       # YANG tunnel name is tunnel_id
+
+                if not tunnel_id:                                                         # tunnel name is required
+                    logging.warning("Cannot stop monitoring: tunnel has no name")          # log missing tunnel name
+                    return                                                                # stop this monitoring action
+
+                self.monitoring_manager.stop_overlay_tunnel_monitoring(tunnel_id)          # call monitoring manager to stop tunnel monitoring
+                logging.info("Stopped overlay monitoring for tunnel_id=%s", tunnel_id)     # log successful stop
+
+        except Exception as e:                                                             # catch any monitoring-related error
+            logging.exception(                                                             # log full exception without crashing callback server
+                "Failed to stop monitoring for object_type=%s object=%s: %s",
+                object_type,
+                parent_dict,
+                e
+            )
+    # =====================================================================================
+    # Rebuild runtime dataplane state from the persistent YANG datastore (Used after Clixon startup transaction-id 0.YANG datastore is the desired-state source of truth.)
+    # =====================================================================================
+    def reconcile_startup_state(self): 
+        with self.startup_reconcile_lock:
+    
+            if self.startup_reconciled:
+                self.startup_reconcile_event.set()
+                return
+    
+            logging.info(
+                "Starting startup reconciliation from YANG datastore"
+            )
+    
+            try:
+                # ==========================================================
+                # 0. Check Forwarder health FIRST
+                # ==========================================================
+                if not self._wait_for_forwarder_healthy():
+                    logging.error(
+                        "Startup reconciliation stopped because "
+                        "Forwarder is unhealthy"
+                    )
+                
+                    self._send_cpe_health_to_controller()
+                    return
+                
+                # ==========================================================
+                # Wait until Clixon RESTCONF is ready
+                # ==========================================================
+                
+                if not self.wait_for_restconf(timeout_sec=60):
+                    logging.error(
+                        "Startup reconciliation stopped because "
+                        "RESTCONF is not ready"
+                    )
+                    return
+                
+                # ==========================================================
+                # 1. Read persistent YANG configuration
+                # ==========================================================
+                
+                current_config = self.config_reader.get_intended_config()
+    
+                self.current_config_cache = current_config
+    
+                # Runtime caches must be rebuilt from the new live dataplane.
+                self.wan_last_ipv4.clear()
+                self.wan_nat_types.clear()
+                self.flow_id_fwmarks.clear()
+    
+                # =================================================================
+                # PHASE 1 - Restore physical interface / LAN configuration
+                # =================================================================
+                interface_operations = []
+    
+                interfaces = current_config.get("interfaces", {})
+    
+                # -------------------------
+                # Restore WAN links
+                # -------------------------
+                underlay = interfaces.get("underlay", {})
+    
+                wan_links = self._as_list(
+                    underlay.get("wan-link", [])
+                )
+    
+                for wan in wan_links:
+                    if not isinstance(wan, dict):
+                        continue
+    
+                    interface_operations.extend(
+                        self._build_wan_link_operations(
+                            wan,
+                            ["*"],
+                            delete=False
+                        )
+                    )
+    
+                # -------------------------
+                # Restore LAN links
+                # -------------------------
+                lan = interfaces.get("lan", {})
+    
+                lan_links = self._as_list(
+                    lan.get("lan-link", [])
+                )
+    
+                for lan_link in lan_links:
+                    if not isinstance(lan_link, dict):
+                        continue
+    
+                    interface_operations.extend(
+                        self._build_lan_link_operations(
+                            lan_link,
+                            ["*"],
+                            delete=False
+                        )
+                    )
+    
+                if interface_operations:
+                    logging.info( "Startup reconciliation: restoring %s WAN/LAN operations",
+                        len(interface_operations)
+                    )
+    
+                    self._send_forwarder_transaction(
+                        operations=interface_operations,
+                        validate_only=False,
+                        timeout=60
+                    )
+    
+                # =================================================================
+                # PHASE 2 - Restore traffic classification / fwmarks
+                # =================================================================
+                traffic_operations = []
+    
+                traffic_classes = self._as_list(
+                    current_config.get("traffic", {}).get("class", [])
+                )
+    
+                for traffic_class in traffic_classes:
+                    if not isinstance(traffic_class, dict):
+                        continue
+    
+                    traffic_operations.extend(
+                        self._build_traffic_class_operations(
+                            traffic_class,
+                            ["*"],
+                            delete=False
+                        )
+                    )
+    
+                if traffic_operations:
+                    logging.info(
+                        "Startup reconciliation: restoring %s traffic-class operations",
+                        len(traffic_operations)
+                    )
+    
+                    self._send_forwarder_transaction(
+                        operations=traffic_operations,
+                        validate_only=False,
+                        timeout=60
+                    )
+    
+                # The Forwarder transaction result should already return fwmarks.
+                # This GET is an additional recovery/synchronization check.
+                self._sync_fwmarks_from_forwarder()
+    
+                # =================================================================
+                # PHASE 3 - Restore WireGuard tunnels + peers
+                # =================================================================
+                tunnel_operations = []
+    
+                tunnels = self._as_list(
+                    current_config.get("overlay", {}).get("tunnel", [])
+                )
+    
+                for tunnel in tunnels:
+                    if not isinstance(tunnel, dict):
+                        continue
+    
+                    tunnel_operations.extend(
+                        self._build_tunnel_operations(
+                            tunnel,
+                            ["*"],
+                            delete=False
+                        )
+                    )
+    
+                if tunnel_operations:
+                    logging.info(
+                        "Startup reconciliation: restoring %s WireGuard operations",
+                        len(tunnel_operations)
+                    )
+    
+                    self._send_forwarder_transaction(
+                        operations=tunnel_operations,
+                        validate_only=False,
+                        timeout=60
+                    )
+
+                # =================================================================
+                # PHASE 4 - Restore firewall rules
+                # =================================================================
+                firewall_operations = []
+                
+                firewall_rules = self._as_list(
+                    current_config.get("firewall", {}).get("rule", [])
+                )
+                
+                for firewall_rule in firewall_rules:
+                
+                    if not isinstance(firewall_rule, dict):
+                        continue
+                
+                    firewall_operations.extend(
+                        self._build_firewall_rule_operations(
+                            firewall_rule,
+                            ["*"],
+                            delete=False
+                        )
+                    )
+                
+                if firewall_operations:
+                
+                    logging.info(
+                        "Startup reconciliation: restoring %s firewall operations",
+                        len(firewall_operations)
+                    )
+                
+                    self._send_forwarder_transaction(
+                        operations=firewall_operations,
+                        validate_only=False,
+                        timeout=60
+                    )
+
+    
+                # =================================================================
+                # PHASE 5 - Restart monitoring derived from YANG configuration
+                # =================================================================
+                for traffic_class in traffic_classes:
+                    if isinstance(traffic_class, dict):
+                        self._start_monitoring_for_object(
+                            "class",
+                            traffic_class
+                        )
+    
+                for tunnel in tunnels:
+                    if (
+                        isinstance(tunnel, dict)
+                        and tunnel.get("resolved-peer")
+                    ):
+                        self._start_monitoring_for_object(
+                            "tunnel",
+                            tunnel
+                        )
+    
+                # =================================================================
+                # PHASE 6 - Rediscover live WAN state
+                # =================================================================
+                self.discover_nat_for_all_wans()
+    
+                # Announce only once after the basic dataplane has been rebuilt.
+                self._announce_to_controller()
+    
+                self.startup_reconciled = True
+    
+                logging.info("Startup reconciliation completed successfully" )
+    
+            except Exception as e:
+                logging.exception("Startup reconciliation failed: %s", e)
+    
+            finally:
+                # Do not leave the normal runtime loop blocked forever.
+                self.startup_reconcile_event.set()
+                
+    # =====================================================================================
+    # Clixon callback handling
+    # =====================================================================================
+    def handle_clixon_transaction(self, xml_body):
+        root = ET.fromstring(xml_body)                                                            #parses the XML transaction body received from Clixon
+
+        phase = root.findtext("phase")
+        transaction_id = root.findtext("transaction-id")
+        validate_only = phase == "validate"                                                       #Clixon sends validate first and commit after successful validation. If Clixon sends phase = "validate"→ validate_only = True
+
+        if transaction_id == "0":
+        
+            logging.info("Received Clixon startup transaction 0 phase=%s", phase)
+        
+            if phase == "validate":                                                              # Validation must never modify the dataplane.
+                return {
+                    "status": "ok",
+                    "phase": phase,
+                    "startup": True,
+                    "message": "Startup reconciliation will run after commit"
+                }
+        
+            if phase == "commit":
+                if not self.startup_reconcile_started:
+                    self.startup_reconcile_started = True
+                    threading.Thread(target=self.reconcile_startup_state,  daemon=True ).start()
+        
+                return {
+                    "status": "ok",
+                    "phase": phase,
+                    "startup": True,
+                    "message": "Startup reconciliation triggered"
+                }
+        
+            raise ValueError(
+                f"Unsupported Clixon startup phase: {phase}"
+            )
+
+        if phase not in ["validate", "commit"]:
+            raise ValueError(f"Unsupported Clixon phase: {phase}")
+
+        operations = []                                                                            #stores the forwarder operations generated for this object
+        changed_objects = {}
+        nat_detection_candidates = []
+
+        monitoring_start_candidates = []                                                          # class/tunnel objects that need monitoring start/update after commit
+        monitoring_stop_candidates = []                                                           # class/tunnel objects that need monitoring stop after commit
+        
+        deleted_tunnel_candidates = []                                                            # fully deleted tunnels whose local key material must be removed after commit
+        
+        controller_reconcile_needed = False                                                       # trigger controller peer resolution after tunnel create/change
+
+        changed = root.find("changed")                                                            #contains leaf changes sent by the Clixon diff callback
+        
+        if changed is not None:
+            for change in changed.findall("change"):
+                new_node = change.find("new")
+                
+                if new_node is None:
+                    continue
+
+                changed_leaf = new_node.findtext("node-name")                              # raw YANG node that actually changed
+
+                parent_xml = self._callback_object_xml(                                    # Prefer normalized object-data from the new callback.
+                    new_node,
+                    fallback="parent"                                                      # With the old callback, fall back to the existing parent-data behavior.
+                )
+                
+                if parent_xml is None:
+                    continue
+                
+                object_type = self._local_name(parent_xml.tag)                             # class/tunnel/wan-link/lan-link/rule/steering
+                parent_dict = self._xml_to_dict(parent_xml)                               # complete semantic object
+
+                object_name = (
+                    parent_dict.get("name")
+                    or parent_dict.get("id")
+                    or parent_dict.get("class")
+                    or object_type)
+
+                object_key = f"{object_type}:{object_name}"                                    # unique key used to group multiple changed leafs under same object
+
+                if object_key not in changed_objects:
+                    changed_objects[object_key] = {
+                        "object_type": object_type,
+                        "parent_dict": parent_dict,
+                        "changed_leafs": []}
+                else:
+                    changed_objects[object_key]["parent_dict"] = parent_dict
+                    
+                if changed_leaf not in changed_objects[object_key]["changed_leafs"]:
+                    changed_objects[object_key]["changed_leafs"].append(changed_leaf)
+
+        for item in changed_objects.values():                                                # after grouping, build operations once per changed object
+            object_type = item["object_type"]
+            parent_dict = item["parent_dict"]
+            changed_leafs = item["changed_leafs"]
+
+            operations.extend(
+                self._build_operations_from_object(
+                    object_type,
+                    parent_dict,
+                    changed_leafs,
+                    delete=False))
+            
+            if object_type == "class":
+                monitoring_start_candidates.append({
+                    "object_type": "class",
+                    "parent_dict": parent_dict
+                })
+            
+            elif object_type == "tunnel":
+            
+                peer_relationship_changed = any(
+                    leaf in changed_leafs
+                    for leaf in [
+                        "remote-cpe-id",
+                        "remote-tunnel-name",
+                        "bind-wan-link"
+                    ]
+                )
+            
+                if peer_relationship_changed:
+                    controller_reconcile_needed = True
+            
+                # Start/update tunnel monitoring only if peer information is already valid.
+                # If peer relationship changed, wait for Controller to PATCH resolved-peer.
+                if (
+                    parent_dict.get("resolved-peer")
+                    and not peer_relationship_changed
+                ):
+                    monitoring_start_candidates.append({
+                        "object_type": "tunnel",
+                        "parent_dict": parent_dict
+                    })                                         
+            
+        added = root.find("added")                                                      # contains newly added datastore objects
+        
+        if added is not None:
+            for node in added.findall("node"):
+            
+                added_xml = self._callback_object_xml(                                # Prefer the normalized semantic object from the callback.
+                    node,
+                    fallback="data"                                                    # If the callback is still the old version, retain the previous behavior and read the raw <data> object.
+                )
+                
+                if added_xml is not None:
+                    object_type = self._local_name(added_xml.tag)
+
+                    if object_type == "traffic":                                        # Clixon may report a newly created traffic class using the parent <traffic> container. 
+                        class_xml = self._first_child(added_xml)
+                    
+                        if (
+                            class_xml is not None
+                            and self._local_name(class_xml.tag) == "class"              # Normalize it to the actual <class>.
+                        ):
+                            added_xml = class_xml
+                            object_type = "class"
+
+                    if object_type == "policy":
+                        steering_xml = self._first_child(added_xml)
+                    
+                        if (
+                            steering_xml is not None
+                            and self._local_name(steering_xml.tag) == "steering"
+                        ):
+                            added_xml = steering_xml
+                            object_type = "steering"
+                
+                    if object_type == "resolved-peer":
+                        parent_data = node.find("parent-data")
+                        tunnel_xml = self._first_child(parent_data)
+                
+                        if (tunnel_xml is not None
+                            and self._local_name(tunnel_xml.tag) == "tunnel"
+                        ):
+                            tunnel_dict = self._xml_to_dict(tunnel_xml)
+                
+                            operations.extend(
+                                self._build_tunnel_operations(
+                                    tunnel_dict,
+                                    ["resolved-peer"],
+                                    delete=False
+                                )
+                            )
+                            monitoring_start_candidates.append({
+                                "object_type": "tunnel",
+                                "parent_dict": tunnel_dict
+                            })
+
+                    else:
+                        operations.extend(
+                            self._build_operations_from_parent_xml(
+                                added_xml,
+                                ["*"],
+                                delete=False
+                            )
+                        )
+                    parent_dict = self._xml_to_dict(added_xml)
+
+                    if object_type == "class":
+                        monitoring_start_candidates.append({
+                            "object_type": "class",
+                            "parent_dict": parent_dict
+                        })
+                    
+                    elif object_type == "tunnel":
+                        if not parent_dict.get("resolved-peer"):
+                            controller_reconcile_needed = True
+                        else:
+                            monitoring_start_candidates.append({
+                                "object_type": "tunnel",
+                                "parent_dict": parent_dict
+                            })
+                    
+                    elif object_type == "overlay":
+                        for tunnel in self._as_list(parent_dict.get("tunnel")):
+                            if not isinstance(tunnel, dict):
+                                continue
+                    
+                            if not tunnel.get("resolved-peer"):
+                                controller_reconcile_needed = True
+                            else:
+                                monitoring_start_candidates.append({
+                                    "object_type": "tunnel",
+                                    "parent_dict": tunnel
+                                })
+
+                    if object_type == "wan-link":
+                        nat_detection_candidates.append(parent_dict)                                # direct WAN-link was added
+                    
+                    elif object_type == "underlay":
+                        for wan_link in self._as_list(parent_dict.get("wan-link")):                 # get WAN links nested under underlay
+                            if isinstance(wan_link, dict):
+                                nat_detection_candidates.append(wan_link)                            # schedule NAT discovery for each WAN
+                    
+                    elif object_type == "interfaces":
+                        underlay = parent_dict.get("underlay") or {}                                 # get nested underlay container
+                    
+                        for wan_link in self._as_list(underlay.get("wan-link")):                     # get WAN links nested under interfaces
+                            if isinstance(wan_link, dict):
+                                nat_detection_candidates.append(wan_link)                             # schedule NAT discovery for each WAN
+
+        deleted = root.find("deleted")                                                               # contains deleted datastore objects
+        
+        if deleted is not None:
+        
+            tunnel_delete_groups = {}                                                                # groups deleted tunnel child nodes by tunnel name
+            other_deleted_nodes = []                                                                 # stores deleted objects that are not tunnel children
+        
+            for node in deleted.findall("node"):
+        
+                data = node.find("data")                                                              # actual deleted child/object
+                deleted_xml = self._first_child(data)                                                 # extract deleted XML object
+        
+                if deleted_xml is None:
+                    continue                                                                          # skip invalid callback entries
+        
+                parent_data = node.find("parent-data")                                                # contains complete old parent object
+                parent_xml = self._first_child(parent_data)                                           # extract old parent object
+        
+                if (
+                    parent_xml is not None
+                    and self._local_name(parent_xml.tag) == "tunnel"
+                ):                                                                                    # Clixon reported a deleted child belonging to a tunnel
+        
+                    tunnel_dict = self._xml_to_dict(parent_xml)                                       # full old tunnel configuration
+                    tunnel_id = tunnel_dict.get("name")                                               # tunnel list key
+        
+                    if tunnel_id:
+        
+                        if tunnel_id not in tunnel_delete_groups:
+                            tunnel_delete_groups[tunnel_id] = {
+                                "parent_dict": tunnel_dict,
+                                "deleted_leafs": set(),
+                                "nodes": []
+                            }                                                                         # create one group per tunnel
+        
+                        tunnel_delete_groups[tunnel_id]["deleted_leafs"].add(
+                            self._local_name(deleted_xml.tag)
+                        )                                                                             # remember which tunnel child was deleted
+        
+                        tunnel_delete_groups[tunnel_id]["nodes"].append(node)                         # keep original node for partial-delete fallback
+        
+                        continue                                                                      # tunnel child already grouped, do not process again
+        
+                other_deleted_nodes.append(node)                                                      # normal deletion unrelated to tunnel grouping
+        
+        
+            for tunnel_id, item in tunnel_delete_groups.items():
+        
+                parent_dict = item["parent_dict"]                                                     # full old tunnel configuration
+                deleted_leafs = item["deleted_leafs"]                                                 # all deleted tunnel children in this transaction
+        
+                expected_leafs = {
+                    key
+                    for key in parent_dict.keys()
+                    if key != "name"
+                }                                                                                     # all old tunnel children except the list key
+        
+                if expected_leafs and expected_leafs.issubset(deleted_leafs):                         # all old tunnel children disappeared together
+        
+                    logging.info("Detected complete tunnel deletion: %s",tunnel_id)                   # complete list-entry deletion detected
+        
+                    operations.extend(
+                        self._build_operations_from_object("tunnel", parent_dict, ["*"], delete=True))       # generate Forwarder DELETE for route and WireGuard tunnel
+        
+                    monitoring_stop_candidates.append({
+                        "object_type": "tunnel",
+                        "parent_dict": parent_dict
+                    })                                                                                # stop tunnel monitoring after successful commit
+
+                    deleted_tunnel_candidates.append(tunnel_id)                                       # defer local key deletion until commit succeeds
+        
+                else:
+                    deleted_allowed_prefixes = []
+                    other_tunnel_deleted_nodes = []
+                
+                    for node in item["nodes"]:
+                
+                        data = node.find("data")
+                        deleted_xml = self._first_child(data)
+                
+                        if deleted_xml is None:
+                            continue
+                
+                        deleted_type = self._local_name(deleted_xml.tag)
+                
+                        if deleted_type == "allowed-prefix":
+                
+                            deleted_prefix = (deleted_xml.text or "").strip()
+                
+                            if deleted_prefix:
+                                deleted_allowed_prefixes.append(deleted_prefix)
+                
+                        else:
+                            other_tunnel_deleted_nodes.append(node)
+                
+                
+                    # -------------------------------------------------------------
+                    # Partial deletion of WireGuard allowed-prefix
+                    # -------------------------------------------------------------
+                    if deleted_allowed_prefixes:
+                
+                        resolved_peer = parent_dict.get("resolved-peer") or {}
+                
+                        old_prefixes = self._as_list(
+                            resolved_peer.get("allowed-prefix")
+                        )
+                
+                        remaining_prefixes = [
+                            prefix
+                            for prefix in old_prefixes
+                            if prefix not in deleted_allowed_prefixes
+                        ]
+                
+                        resolved_peer["allowed-prefix"] = remaining_prefixes
+                        parent_dict["resolved-peer"] = resolved_peer
+
+                        operations.append(self._operation("DELETE",
+                                f"/api/v1/routes/static/{tunnel_id}-peer-routes"                        # Delete old route-set first so stale kernel routes are removed
+                            )
+                        )
+                
+                        operations.extend(
+                            self._build_tunnel_operations(
+                                parent_dict,
+                                ["allowed-prefix"],
+                                delete=False
+                            )
+                        )
+                
+                
+                    # Preserve existing behaviour for other partial tunnel deletions
+                    for node in other_tunnel_deleted_nodes:
+                
+                        data = node.find("data")
+                        deleted_xml = self._first_child(data)
+                
+                        operations.extend(
+                            self._build_operations_from_parent_xml(
+                                deleted_xml,
+                                ["*"],
+                                delete=True
+                            )
+                        )                                                                          
+                        
+        
+            for node in other_deleted_nodes:
+                data = node.find("data")                                                              # actual deleted object
+                deleted_xml = self._first_child(data)                                                 # extract deleted object XML
+
+                if (
+                    deleted_xml is not None
+                    and self._local_name(deleted_xml.tag) == "traffic"                                # Clixon may wrap a deleted traffic class in <traffic>.
+                ):
+                    class_xml = self._first_child(deleted_xml)
+                
+                    if (
+                        class_xml is not None
+                        and self._local_name(class_xml.tag) == "class"
+                    ):
+                        deleted_xml = class_xml
+        
+                operations.extend(
+                    self._build_operations_from_parent_xml(
+                        deleted_xml,
+                        ["*"],
+                        delete=True
+                    )
+                )                                                                                     # process non-tunnel deletions normally
+        
+                if deleted_xml is not None:
+        
+                    object_type = self._local_name(deleted_xml.tag)                                   # determine deleted object type
+                    parent_dict = self._xml_to_dict(deleted_xml)                                      # convert deleted object into Python dict
+        
+                    if object_type in ["class", "tunnel"]:
+        
+                        monitoring_stop_candidates.append({
+                            "object_type": object_type,
+                            "parent_dict": parent_dict
+                        })                                                                            # stop monitoring after successful commit
+                
+        forwarder_result = None
+
+        if operations:
+            forwarder_result = self._send_forwarder_transaction(
+                operations=operations,
+                validate_only=validate_only)                                                           # send transaction only when Forwarder operations exist
+
+        if phase == "commit":
+            for wan in nat_detection_candidates:
+        
+                threading.Thread(target=self._wait_for_wan_ready, args=(wan,), daemon=True).start()                                                                       # wait for DHCP without blocking Clixon commit
+
+            for item in monitoring_start_candidates:                                        # start/update monitoring only after real commit
+                self._start_monitoring_for_object(                              
+                    item["object_type"],                                                    # class or tunnel
+                    item["parent_dict"]                                                     # object data
+                )
+
+            for item in monitoring_stop_candidates:                                        # stop monitoring only after real commit
+                self._stop_monitoring_for_object(                                      
+                    item["object_type"],                                                    # class or tunnel
+                    item["parent_dict"]                                                     # object data
+                )
+
+            for tunnel_id in deleted_tunnel_candidates:
+                self._delete_wireguard_tunnel_keys(tunnel_id)                                # delete private/public key files and runtime key cache after committed tunnel deletion
+        
+                overlay = self.current_config_cache.get("overlay", {})
+                tunnels = self._as_list(overlay.get("tunnel", []))
+        
+                overlay["tunnel"] = [
+                    tunnel
+                    for tunnel in tunnels
+                    if not isinstance(tunnel, dict)
+                    or tunnel.get("name") != tunnel_id
+                ]                                                                             # prevent operational-state builder from republishing deleted tunnel from stale cache
+         
+            if controller_reconcile_needed:
+                    logging.info("Tunnel configuration requires controller peer reconciliation")
+                    threading.Thread(target=self._announce_to_controller, daemon=True).start()       # notify controller without delaying Clixon commit
+        return {
+            "status": "ok",
+            "phase": phase,
+            "validate_only": validate_only,
+            "operations": operations,
+            "forwarder_result": forwarder_result}
+
+    # ===========================================================================================================
+    # Runtime steering decisions (Decisions made according to Metric values recived from Monitoring module)
+    # ===========================================================================================================
+    def _candidate_satisfies_slo(self, candidate_state, policy):
+        if not candidate_state:                                                            #If there is no state object, candidate is invalid.
+            return False
+
+        oper_status = candidate_state.get("oper-status")                                   #Reads the operational status.
+        if oper_status not in ["up", "degraded"]:                                         #Only candidates with up or degraded are accepted. Anything else is rejected
+            return False
+
+        max_latency = policy.get("max-latency-ms")                                         #Reads max allowed latency from policy.
+        if max_latency is not None:
+            latency = candidate_state.get("latency-ms")                                    #Reads measured latency from state
+            if latency is None or latency > max_latency:                                   #Reject if latency is missing or exceeds the threshold.
+                return False
+
+        max_jitter = policy.get("max-jitter-ms")                                           #Reads max allowed jitter from policy.
+        if max_jitter is not None:
+            jitter = candidate_state.get("jitter-ms")                                      #Reads measured jitter from state
+            if jitter is None or jitter > max_jitter:                                      #Reject if jitter is missing or exceeds the threshold
+                return False
+
+        max_loss = policy.get("max-loss-percent")                                          #Reads max allowed packet loss from policy.
+        if max_loss is not None:
+            loss = candidate_state.get("loss-percent")                                     #Reads measured packet loss from state
+            if loss is None or loss > float(max_loss):                                     #Reject if packet loss is missing or exceeds the threshold
+                return False
+
+        min_bw = policy.get("min-bandwidth-kbps")                                          #Reads min allowed BW from policy.
+        if min_bw is not None:
+            bw = candidate_state.get("available-bandwidth-kbps")                           #Reads available BW from state
+            if bw is None or bw < min_bw:                                                  #Reject if BW is missing or less than the threshold
+                return False
+
+        return True                                                                        #If all checks pass, candidate satisfies the SLO
+
+    def _metric_to_candidate_state(self, name, metric, flow_id=None):
+        state = {
+            "name": name,                                                                  # WAN link name or tunnel name
+            "oper-status": "down" if metric.get("stale") else "up",                       # stale metric means candidate is down
+            "latency-ms": metric.get("latency_ms"),
+            "jitter-ms": metric.get("jitter_ms"),
+            "loss-percent": metric.get("loss_percent"),
+            "available-bandwidth-kbps": metric.get("available_bandwidth_kbps"),
+            "metric-source": metric.get("source"),
+            "metric-reason": metric.get("reason"),
+            "metric-timestamp": metric.get("timestamp")}
+    
+        if flow_id is not None:
+            state["flow-id"] = str(flow_id)                                                # only added for underlay flow metrics
+    
+        return state
+    
+    def _extract_candidate_states(self, policy, flow_state_map, tunnel_state_map):        # Build candidates using per-WAN flow metrics for underlay and tunnel metrics for overlay
+        traffic_class = policy.get("class")                                               # traffic class associated with this policy
+        steering_mode = policy.get("steering-mode")                                       # failover or load-balance
+        candidates = []                                                                   # final candidate list
+    
+        if not traffic_class:                                                             # traffic class is required
+            return candidates                                                             # without class, flow metric cannot be selected
+    
+        if steering_mode == "failover":                                                   # failover selects first eligible candidate in order
+            failover_link_type = policy.get("failover-link-type")                         # wan-link or tunnel
+    
+            if failover_link_type == "wan-link":                                          # failover over underlay WAN links
+                ordered_names = []                                                        # candidate WAN links in policy order
+    
+                primary = policy.get("primary-wan-link")                                  # primary WAN link
+                if primary:                                                               # if primary is configured
+                    ordered_names.append(primary)                                         # add primary first
+    
+                ordered_names.extend(self._as_list(policy.get("secondary-wan-link")))     # add secondary WAN links after primary
+    
+                for wan_name in ordered_names:                                            # loop through candidate WAN links
+                    state = flow_state_map.get(traffic_class, {}).get(wan_name)           # get metric for this traffic class through this WAN link
+    
+                    if state:                                                             # if metric state exists
+                        candidates.append(("wan-link", wan_name, state))                  # add WAN candidate with its own metric state
+    
+            elif failover_link_type == "tunnel":                                          # failover over overlay tunnels
+                ordered_names = []                                                        # candidate tunnels in policy order
+    
+                primary = policy.get("primary-tunnel")                                    # primary tunnel
+                if primary:                                                               # if primary tunnel exists
+                    ordered_names.append(primary)                                         # add primary first
+    
+                ordered_names.extend(self._as_list(policy.get("secondary-tunnel")))       # add secondary tunnels after primary
+    
+                for tunnel_name in ordered_names:                                         # loop through candidate tunnels
+                    state = tunnel_state_map.get(tunnel_name)                             # get tunnel health metric
+    
+                    if state:                                                             # if metric state exists
+                        candidates.append(("tunnel", tunnel_name, state))                 # add tunnel candidate
+    
+        elif steering_mode == "load-balance":                                             # load-balance selects all eligible candidates
+            load_balance_link_type = policy.get("load-balance-link-type")                 # wan-link or tunnel
+    
+            if load_balance_link_type == "wan-link":                                      # load-balance over underlay WAN links
+                for wan_name in self._as_list(policy.get("load-balance-wan-link")):       # loop through configured WAN members
+                    state = flow_state_map.get(traffic_class, {}).get(wan_name)           # get metric for this traffic class through this WAN link
+    
+                    if state:                                                             # if metric state exists
+                        candidates.append(("wan-link", wan_name, state))                  # add WAN candidate with its own metric state
+    
+            elif load_balance_link_type == "tunnel":                                      # load-balance over overlay tunnels
+                for tunnel_name in self._as_list(policy.get("load-balance-tunnel")):      # loop through configured tunnel members
+                    state = tunnel_state_map.get(tunnel_name)                             # get tunnel health metric
+    
+                    if state:                                                             # if metric state exists
+                        candidates.append(("tunnel", tunnel_name, state))                 # add tunnel candidate
+    
+        return candidates                                                                 # return all candidates for this policy
+    
+    def _make_steering_decisions(self, current_config, flow_state_map, tunnel_state_map):
+        decisions = []                                                                      #Creates an empty list for steering decisions.
+
+        steering_policies = current_config.get("policy", {}).get("steering", [])            #Reads steering policies from config.          
+
+        for policy in steering_policies:                                                    #Loops through each steering policy.
+            traffic_class = policy.get("class")                                             #Reads traffic class associated with this policy.
+            if not traffic_class:
+                continue                                                                    #Skip if missing
+
+            steering_mode = policy.get("steering-mode")                                     #Reads steering mode
+            candidates = self._extract_candidate_states(policy, flow_state_map, tunnel_state_map) #Builds the list of candidate paths according to this policy.
+
+            eligible = []                                                                   #Creates lists for accepted and rejected candidates
+            rejected = []
+
+            for link_type, name, state in candidates:                                       #Loops through each candidate.
+                if self._candidate_satisfies_slo(state, policy):
+                    eligible.append((link_type, name, state))                               #If candidate passes SLO checks, put it in eligible
+                else:
+                    rejected.append({                                                       #If candidate fails, add summary info into rejected
+                        "name": name,
+                        "link-type": link_type,
+                        "oper-status": state.get("oper-status"),
+                        "latency-ms": state.get("latency-ms"),
+                        "jitter-ms": state.get("jitter-ms"),
+                        "loss-percent": state.get("loss-percent"),
+                        "available-bandwidth-kbps": state.get("available-bandwidth-kbps")})
+
+            now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())                     #Creates current UTC timestamp in ISO-like format.
+
+            if steering_mode == "failover":                                                 #Enter failover logic.
+                if eligible:                                                                #If at least one candidate satisfies the SLO
+                    selected_link_type, selected_name, selected_state = eligible[0]          #Choose the first eligible candidate.
+
+                    if candidates and selected_name == candidates[0][1]:
+                        reason = "primary path satisfies SLO"
+                    else:
+                        reason = "primary path failed SLO; failed over to next eligible path"
+
+                    decision = {
+                        "action": "set-active-path",
+                        "traffic-class": traffic_class,
+                        "selected-path": selected_name,
+                        "selected-path-type": selected_link_type,
+                        "decision-status": "selected",
+                        "reason": reason,
+                        "last-change": now_ts,
+                        "candidate-summary": {
+                            "eligible": [item[1] for item in eligible],
+                            "rejected": rejected}}
+                else:                                                                       #If no candidate is eligible, creates a no-path decision.
+                    decision = {
+                        "action": "set-active-path",
+                        "traffic-class": traffic_class,
+                        "selected-path": None,
+                        "selected-path-type": policy.get("failover-link-type"),
+                        "decision-status": "no-path",
+                        "reason": "no candidate satisfies SLO or candidates are down",
+                        "last-change": now_ts,
+                        "candidate-summary": {
+                            "eligible": [],
+                            "rejected": rejected}}
+
+                decisions.append(decision)
+
+            elif steering_mode == "load-balance":                                          #Enter load-balance logic
+                if eligible:                                                                #If some candidates satisfy SLO:
+                    eligible_names = [item[1] for item in eligible]
+
+                    decision = {                                                            #Creates load-balance decision listing all selected paths
+                        "action": "set-load-balance-policy",
+                        "traffic-class": traffic_class,
+                        "eligible-paths": eligible_names,
+                        "selected-path-type": policy.get("load-balance-link-type"),
+                        "decision-status": "selected",
+                        "reason": "Candidates satisfying SLO for Load-Balance",
+                        "last-change": now_ts,
+                        "candidate-summary": {
+                            "eligible": eligible_names,
+                            "rejected": rejected}}
+                else:                                                                       #If none are eligible, create a no-path load-balance decision.
+                    decision = {
+                        "action": "set-load-balance-policy",
+                        "traffic-class": traffic_class,
+                        "eligible-paths": [],
+                        "selected-path-type": policy.get("load-balance-link-type"),
+                        "decision-status": "no-path",
+                        "reason": "no load-balance candidate satisfies SLO or candidates are down",
+                        "last-change": now_ts,
+                        "candidate-summary": {
+                            "eligible": [],
+                            "rejected": rejected}}
+
+                decisions.append(decision)
+
+        return decisions                                                                     #returns all steering decisions.
+
+    def _stabilize_steering_decisions(self, steering_decisions):
+        stable_decisions = []
+    
+        for decision in steering_decisions:
+            traffic_class = decision.get("traffic-class")
+            action = decision.get("action") 
+            if not traffic_class:
+                continue
+    
+            # ---------------------------------------------------------
+            # Create a comparable representation of the steering result
+            # ---------------------------------------------------------
+            if action == "set-active-path":
+                decision_key = (action, decision.get("selected-path-type"), decision.get("selected-path"))
+            elif action == "set-load-balance-policy":
+                decision_key = (action, decision.get("selected-path-type"), tuple(sorted(decision.get("eligible-paths", []))))
+            else:
+                continue
+    
+            current_key = self.applied_steering_decisions.get(traffic_class)
+    
+            # ---------------------------------------------------------
+            # First decision for this traffic class --> apply immediately
+            # ---------------------------------------------------------
+            if current_key is None:
+                self.applied_steering_decisions[traffic_class] = decision_key
+                self.pending_steering_decisions.pop(traffic_class, None)
+    
+                stable_decisions.append(decision)
+    
+                logging.info("Initial steering decision applied: class=%s decision=%s", traffic_class, decision_key)
+
+                continue
+    
+            # ---------------------------------------------------------
+            # Decision has not changed -> nothing to send to Forwarder
+            # ---------------------------------------------------------
+            if decision_key == current_key:
+                self.pending_steering_decisions.pop(traffic_class, None)
+                logging.info("Steering unchanged: class=%s decision=%s", traffic_class, decision_key)
+                continue
+    
+            # ---------------------------------------------------------
+            # New candidate decision -> start or increment confirmation
+            # ---------------------------------------------------------
+            pending = self.pending_steering_decisions.get(traffic_class)
+    
+            if pending and pending.get("decision-key") == decision_key:
+                pending["count"] += 1
+            else:
+                pending = {"decision-key": decision_key, "count": 1}
+    
+                self.pending_steering_decisions[traffic_class] = pending
+    
+            logging.info("Steering change pending: class=%s current=%s candidate=%s confirmation=%s/%s", traffic_class,  current_key, decision_key, pending["count"], self.steering_confirm_cycles )
+    
+            # ---------------------------------------------------------
+            # Apply only after same decision persists for N cycles
+            # ---------------------------------------------------------
+            if pending["count"] >= self.steering_confirm_cycles:
+    
+                self.applied_steering_decisions[traffic_class] = decision_key
+                self.pending_steering_decisions.pop(traffic_class, None)
+    
+                stable_decisions.append(decision)
+    
+                logging.info("Steering change confirmed: class=%s new-decision=%s", traffic_class, decision_key)
+    
+        return stable_decisions
+
+    def _build_steering_operations(self, steering_decisions):
+        operations = []
+
+        for decision in steering_decisions:
+            traffic_class = decision.get("traffic-class")
+            action = decision.get("action")
+
+            if not traffic_class:
+                continue
+
+            if action == "set-active-path":
+                payload = {
+                    "traffic_class": traffic_class,
+                    "selected_path": decision.get("selected-path"),
+                    "selected_path_type": decision.get("selected-path-type"),
+                    "decision_status": decision.get("decision-status"),
+                    "reason": decision.get("reason"),
+                    "candidate_summary": decision.get("candidate-summary", {})
+                }
+
+                operations.append(
+                    self._operation(
+                        "PUT",
+                        f"/api/v1/steering/{traffic_class}/active-path",
+                        payload
+                    )
+                )
+
+            elif action == "set-load-balance-policy":
+                payload = {
+                    "traffic_class": traffic_class,
+                    "eligible_paths": decision.get("eligible-paths", []),
+                    "selected_path_type": decision.get("selected-path-type"),
+                    "decision_status": decision.get("decision-status"),
+                    "reason": decision.get("reason"),
+                    "candidate_summary": decision.get("candidate-summary", {})
+                }
+
+                operations.append(
+                    self._operation(
+                        "PUT",
+                        f"/api/v1/steering/{traffic_class}/load-balance",
+                        payload
+                    )
+                )
+
+        return operations
+    # =====================================================================================
+    # Main cycle
+    # =====================================================================================
+    def run_once(self):
+        current_config = self.config_reader.get_intended_config()                           # read intended config from YANG datastore
+        self.current_config_cache = current_config
+
+        # ---------------------------------------------------------
+        # Check Forwarder health FIRST
+        # ---------------------------------------------------------
+        forwarder_healthy = self._update_cpe_state()
+    
+        # CPE heartbeat to Controller is independent of Forwarder tasks
+        self._send_cpe_health_to_controller()
+    
+        if not forwarder_healthy:
+    
+            logging.warning(
+                "Skipping Forwarder-dependent runtime tasks "
+                "because Forwarder is unhealthy"
+            )
+    
+            return {
+                "status": "degraded",
+                "reason": "forwarder unhealthy"
+            }
+
+        self.check_wan_ip_changes()                                                         # detect changed WAN endpoint and notify controller
+  
+        if not hasattr(self, "metric_reader"):
+            logging.warning("metric_reader not configured")
+            return {"status": "skipped", "reason": "metric_reader not configured"}
+    
+        steering_policies = self._as_list(
+            current_config.get("policy", {}).get("steering", [])
+        )                                                                                   # read all steering policies
+    
+        flow_state_map = {}                                                                 # traffic_class -> flow metric state
+        tunnel_state_map = {}                                                               # tunnel_id -> tunnel metric state
+    
+        for policy in steering_policies:
+            traffic_class = policy.get("class")                                             # traffic class name
+    
+            if not traffic_class:
+                continue
+    
+            uses_wan_link = (
+                policy.get("failover-link-type") == "wan-link"
+                or policy.get("load-balance-link-type") == "wan-link"
+            )                                                                               # this policy uses underlay WAN links
+    
+            uses_tunnel = (
+                policy.get("failover-link-type") == "tunnel"
+                or policy.get("load-balance-link-type") == "tunnel"
+            )                                                                               # this policy uses overlay tunnels
+    
+            if uses_wan_link:
+                flow_id = self.flow_id_fwmarks.get(traffic_class)
+            
+                if flow_id is None:
+                    flow_id = self._assign_temporary_fake_fwmark(traffic_class)
+            
+                flow_state_map.setdefault(traffic_class, {})
+            
+                wan_names = []
+            
+                if policy.get("primary-wan-link"):
+                    wan_names.append(policy.get("primary-wan-link"))
+            
+                wan_names.extend(self._as_list(policy.get("secondary-wan-link")))
+                wan_names.extend(self._as_list(policy.get("load-balance-wan-link")))
+            
+                seen_wan_names = set()
+            
+                for wan_name in wan_names:
+                    if not wan_name or wan_name in seen_wan_names:
+                        continue
+            
+                    seen_wan_names.add(wan_name)
+            
+                    metric = self.metric_reader.get_flow_metric(flow_id, wan_name)
+            
+                    flow_state_map[traffic_class][wan_name] = self._metric_to_candidate_state(wan_name, metric,flow_id)          # store one flow state per traffic class per wan link
+    
+            if uses_tunnel:
+                tunnel_names = []                                                           # collect tunnel candidates used by this policy
+    
+                if policy.get("primary-tunnel"):
+                    tunnel_names.append(policy.get("primary-tunnel"))
+    
+                tunnel_names.extend(self._as_list(policy.get("secondary-tunnel")))
+                tunnel_names.extend(self._as_list(policy.get("load-balance-tunnel")))
+    
+                for tunnel_name in tunnel_names:
+                    if not tunnel_name or tunnel_name in tunnel_state_map:
+                        continue
+    
+                    metric = self.metric_reader.get_tunnel_metric(tunnel_name)              # read tunnel health metric
+    
+                    tunnel_state_map[tunnel_name] = self._metric_to_candidate_state(
+                        tunnel_name,
+                        metric
+                    )                                                                       # store tunnel state by tunnel name
+    
+        steering_decisions = self._make_steering_decisions(current_config, flow_state_map, tunnel_state_map )       # make steering decisions using flow and tunnel states
+
+        stable_steering_decisions = self._stabilize_steering_decisions(steering_decisions)
+
+        self.latest_flow_state_map = flow_state_map                                         # replace previous current flow metric snapshot & expose latest underlay flow metrics through YANG state
+        self.latest_tunnel_state_map = tunnel_state_map                                     # replace previous current tunnel metric snapshot & expose latest underlay flow metrics through YANG state
+    
+        steering_operations = self._build_steering_operations(stable_steering_decisions)            # convert decisions to forwarder operations
+    
+        if steering_operations:
+            self._send_forwarder_transaction(
+                operations=steering_operations,
+                validate_only=False
+            )                                                                               # runtime steering is not Clixon validate phase
+    
+        result = {
+            "flow_state_map": flow_state_map,
+            "tunnel_state_map": tunnel_state_map,
+            "decisions": steering_decisions
+        }
+    
+        logging.info("Agent runtime steering cycle completed")
+        #print("\n===== STEERING DECISIONS =====")
+        #print(json.dumps(result, indent=2))
+    
+        return result
+
+    def run_forever(self, interval_sec=5):                                                                # Repeat the full execution cycle continuously.
+        while True:
+            try:
+                self.run_once()
+            except Exception as e:
+                logging.exception("Agent loop failed: %s", e)
+
+            time.sleep(interval_sec)
+
+    def run_clixon_callback_server(self, host="0.0.0.0", port=8080):
+        ClixonCallbackHandler.agent = self
+
+        server = HTTPServer((host, port), ClixonCallbackHandler)                            #creates the small HTTP server used by Clixon callback plugin
+
+        logging.info("Starting Clixon callback server on %s:%s", host, port)
+        server.serve_forever()
+
+class ClixonCallbackHandler(BaseHTTPRequestHandler):
+    agent = None
+
+    def do_GET(self):
+        try:
+            if self.path != "/internal/operational-state":
+                self.send_response(404)                                                   # reject unknown internal GET endpoints
+                self.end_headers()
+                return
+    
+            xml_body = self.agent.build_operational_state_xml()                            # build current operational-state XML
+    
+            encoded_body = xml_body.encode("utf-8")                                        # convert XML into HTTP response bytes
+    
+            self.send_response(200)                                                     
+            self.send_header(
+                "Content-Type",
+                "application/yang-data+xml"
+            )                                                                              # response contains YANG XML
+            self.send_header(
+                "Content-Length",
+                str(len(encoded_body))
+            )                                                                              # send correct HTTP body length
+            self.end_headers()
+    
+            self.wfile.write(encoded_body)                                                 # return state XML to Clixon state plugin
+    
+        except Exception as e:
+            logging.exception("Operational state request failed: %s",e)                                                                          
+    
+            error_body = json.dumps({
+                "status": "error",
+                "reason": str(e)
+            }).encode("utf-8")                                                             # construct internal error response
+    
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+    
+            self.wfile.write(error_body)                                                   # return error to state plugin
+
+    def do_POST(self):
+        try:
+            if self.path not in [
+                "/internal/clixon/validate-config-change",
+                "/internal/clixon/commit-config-change"]:
+
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            length = int(self.headers.get("Content-Length", 0))                           #number of bytes in the Clixon callback request body
+            body = self.rfile.read(length).decode("utf-8")                                #reads the XML callback body as text
+
+            print("\n===== RAW CLIXON CALLBACK XML =====")                                #JUST TO VERIFY. CAN REMOVE THIS LINE LATER
+            print(body)
+
+            result = self.agent.handle_clixon_transaction(body)                            #passes the XML transaction to the main agent logic
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
+
+        except Exception as e:
+            logging.exception("Clixon callback handling failed: %s", e)
+
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "error",
+                "reason": str(e)}).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        return
+
+if __name__ == "__main__":
+    agent = Agent()
+
+    steering_thread = threading.Thread(
+        target=agent.run_steering_loop_after_restconf_ready,
+        kwargs={"interval_sec": 10},
+        daemon=True
+    )
+    steering_thread.start()                                   # Run steering loop in background after RESTCONF is ready
+    
+    agent.run_clixon_callback_server()                        # Start internal API used by Clixon callback plugin.
