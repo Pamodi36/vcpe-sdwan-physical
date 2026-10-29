@@ -1,0 +1,270 @@
+services:
+
+  # ============================================================
+  # vCPE Forwarder
+  # Dataplane programming component
+  # ============================================================
+  vcpe-forwarder:
+    build:
+      context: ./vcpe-forwarder
+
+    container_name: vcpe-forwarder
+    restart: unless-stopped
+
+    # Required because the Forwarder must directly access
+    # Linux interfaces, routing tables, nftables and WireGuard.
+    network_mode: host
+
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    environment:
+      - API_BIND=0.0.0.0
+      - API_PORT=9090
+      - FORWARDER_EXECUTE=1
+      - 'WAN_LINK_MAP_JSON={"UPL1":"ens5","UPL2":"ens6"}'
+
+    volumes:
+      - vcpe_forwarder_state:/app/var/lib/forwarder
+      - ./shared-keys:/var/lib/sdwan-cpe/keys:ro
+
+
+  # ============================================================
+  # vCPE Agent
+  # Control-plane / orchestration logic
+  # ============================================================
+  vcpe-agent:
+    build:
+      context: ./vcpe-agent
+
+    container_name: vcpe-agent
+    restart: unless-stopped
+
+    environment:
+      - API_BIND=0.0.0.0
+      - API_PORT=8080
+
+      # --------------------------------------------------------
+      # Forwarder
+      # Forwarder uses host networking, therefore Agent reaches
+      # it through the Docker host gateway.
+      # --------------------------------------------------------
+      - FORWARDER_URL=http://host.docker.internal:9090
+
+      # --------------------------------------------------------
+      # SBI / Clixon
+      # --------------------------------------------------------
+      - SBI_URL=http://127.0.0.1:8383
+
+      # --------------------------------------------------------
+      # Monitoring
+      # Monitoring also uses host networking.
+      # --------------------------------------------------------
+      - MONITORING_URL=http://host.docker.internal:9100
+
+      # --------------------------------------------------------
+      # InfluxDB
+      # Agent remains inside Docker mgmt network and therefore
+      # can use the Docker service name "influxdb".
+      # --------------------------------------------------------
+      - INFLUX_URL=http://influxdb:8086
+      - INFLUX_BUCKET=vcpe
+      - INFLUX_ORG=thesis
+      - INFLUX_TOKEN=${INFLUX_TOKEN}
+
+      # Keep fake for now.
+      # Change to real/influx mode once Metric Reader integration
+      # is implemented and tested.
+      - METRIC_READER_MODE=fake
+
+      # --------------------------------------------------------
+      # External SD-WAN Controller
+      # --------------------------------------------------------
+      - CONTROLLER_URL=http://${CONTROLLER_IP}:8080
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      - vcpe-forwarder
+      - vcpe-monitoring
+      - influxdb
+
+    volumes:
+      - vcpe_sbi_state:/var/lib/clixon
+      - ./shared-keys:/var/lib/sdwan-cpe/keys
+
+    ports:
+      - "8080:8080"
+      - "8383:8383"
+
+    networks:
+      - mgmt
+
+
+  # ============================================================
+  # vCPE Monitoring
+  #
+  # Receives monitoring jobs from Agent.
+  # Executes active probes.
+  # Writes metrics into InfluxDB.
+  # ============================================================
+  vcpe-monitoring:
+    build:
+      context: ./vcpe-monitoring
+
+    container_name: vcpe-monitoring
+    restart: unless-stopped
+
+    # IMPORTANT:
+    # Monitoring must see the real Linux WAN/WireGuard interfaces.
+    # API + OpenTelemetry SDK + OpenTelemetry Collector run inside
+    # this same container; no extra Compose service is added.
+    network_mode: host
+
+    cap_add:
+      - NET_RAW
+
+    environment:
+
+      # --------------------------------------------------------
+      # Monitoring REST API
+      # --------------------------------------------------------
+      - API_BIND=0.0.0.0
+      - API_PORT=9100
+      - LOG_LEVEL=INFO
+
+      # --------------------------------------------------------
+      # Logical SD-WAN WAN name -> Linux interface
+      # --------------------------------------------------------
+      - 'WAN_LINK_MAP_JSON={"UPL1":"ens5","UPL2":"ens6"}'
+
+      # --------------------------------------------------------
+      # Existing InfluxDB
+      # Monitoring uses host networking, so use host-published 8086.
+      # --------------------------------------------------------
+      - INFLUX_URL=http://127.0.0.1:8086
+      - INFLUX_BUCKET=vcpe
+      - INFLUX_ORG=thesis
+      - INFLUX_TOKEN=${INFLUX_TOKEN}
+      - INFLUX_ENABLED=true
+
+      # --------------------------------------------------------
+      # Legacy diagnostic probes used by the original Agent
+      # --------------------------------------------------------
+      - PING_COUNT=4
+      - PING_PROCESS_TIMEOUT_SEC=10
+      - IPERF_PORT=5201
+      - IPERF_DURATION_SEC=3
+      - IPERF_PROCESS_TIMEOUT_SEC=12
+      - IPERF_BIND_DEVICE=true
+
+      # No real TWAMP client/reflector is bundled yet.
+      - TWAMP_COMMAND_TEMPLATE=
+
+      # --------------------------------------------------------
+      # MEF 105-aligned model (not a formal compliance claim)
+      # --------------------------------------------------------
+      - MEF105_CALCULATION_INTERVAL_SEC=5
+      - MEF105_DELAY_THRESHOLD_MS=80
+      - MEF105_DELAY_VARIATION_THRESHOLD_MS=20
+      - MEF105_LOSS_RATIO_THRESHOLD=0.02
+      - MEF105_RECENT_TCA_LIMIT=200
+
+      # --------------------------------------------------------
+      # OpenTelemetry SDK -> embedded Collector (loopback only)
+      # --------------------------------------------------------
+      - OTEL_ENABLED=true
+      - OTEL_SERVICE_NAME=vcpe-monitoring
+      - OTEL_METRICS_ENDPOINT=http://127.0.0.1:4318/v1/metrics
+      - OTEL_EXPORT_INTERVAL_MS=5000
+      - OTEL_COLLECTOR_HEALTH_URL=http://127.0.0.1:13133/
+      - OTEL_COLLECTOR_CONFIG=/etc/otel/collector-config.yaml
+      - OTEL_COLLECTOR_BINARY=/usr/local/bin/otelcol-contrib
+      - OTEL_COLLECTOR_START_TIMEOUT_SEC=20
+
+    depends_on:
+      - influxdb
+
+    # DO NOT add:
+    #
+    # ports:
+    #   - "9100:9100"
+    #
+    # because network_mode: host already exposes port 9100
+    # directly on the host.
+    #
+    # DO NOT attach this container to "mgmt" either.
+
+
+  # ============================================================
+  # InfluxDB
+  # Time-series database used by Monitoring + Agent Metric Reader
+  # ============================================================
+  influxdb:
+    image: influxdb:2.7
+
+    container_name: influxdb
+    restart: unless-stopped
+
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=adminadmin
+      - DOCKER_INFLUXDB_INIT_ORG=thesis
+      - DOCKER_INFLUXDB_INIT_BUCKET=vcpe
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUX_TOKEN}
+
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+
+    ports:
+      - "8086:8086"
+
+    networks:
+      - mgmt
+
+
+  # ============================================================
+  # Grafana
+  # Monitoring visualization
+  # ============================================================
+  grafana:
+    image: grafana/grafana:11.2.0
+
+    container_name: grafana
+    restart: unless-stopped
+
+    depends_on:
+      - influxdb
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+    networks:
+      - mgmt
+
+
+# ==============================================================
+# Docker internal management network
+# ==============================================================
+networks:
+  mgmt:
+    driver: bridge
+
+
+# ==============================================================
+# Persistent volumes
+# ==============================================================
+volumes:
+  vcpe_forwarder_state:
+  vcpe_sbi_state:
+  influxdb_data:
+  grafana_data:
