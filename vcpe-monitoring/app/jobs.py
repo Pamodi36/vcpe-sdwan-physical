@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Literal
+from typing import Callable, Literal
 
+from .clock_sync import ClockSyncChecker
 from .influx import InfluxWriter
 from .interface_resolver import InterfaceResolver
-from .models import FlowMonitoringRequest, JobView, MetricSample, TunnelMonitoringRequest
-from .probes import run_iperf3, run_ping, run_twamp
+from .models import (
+    FlowMonitoringRequest,
+    JobView,
+    MetricSample,
+    PassiveSnapshot,
+    TunnelMonitoringRequest,
+)
+from .passive_tcp import PassiveManager
+from .probes import run_iperf3
+from .rule_engine import RuleEngine
 from .settings import Settings
+from .stamp import run_stamp
 
 LOG = logging.getLogger(__name__)
 
@@ -26,13 +37,27 @@ class JobHandle:
     run_count: int = 0
     last_error: str | None = None
     last_sample: MetricSample | None = None
+    last_passive: PassiveSnapshot | None = None
+    state: str = "starting"
+    last_compliance_mono: float | None = None
+    last_bandwidth_mono: float | None = None
 
 
 class JobManager:
-    def __init__(self, settings: Settings, resolver: InterfaceResolver, writer: InfluxWriter) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        resolver: InterfaceResolver,
+        writer: InfluxWriter,
+        passive: PassiveManager,
+        clock_checker: ClockSyncChecker,
+    ) -> None:
         self.settings = settings
         self.resolver = resolver
         self.writer = writer
+        self.passive = passive
+        self.clock_checker = clock_checker
+        self.rule_engine = RuleEngine()
         self._jobs: dict[str, JobHandle] = {}
         self._lock = asyncio.Lock()
 
@@ -48,18 +73,9 @@ class JobManager:
         interface = self.resolver.resolve_wan(request.wan_link)
         key = self.flow_key(request.flow_id, request.wan_link)
         updated = await self._stop_key(key, missing_ok=True)
-
-        task = asyncio.create_task(
-            self._flow_worker(key, request, interface),
-            name=f"monitor-{key}",
-        )
-        handle = JobHandle(
-            job_type="flow",
-            key=key,
-            interface=interface,
-            request=request,
-            task=task,
-        )
+        self.passive.ensure(interface)
+        task = asyncio.create_task(self._flow_worker(key, request, interface), name=f"monitor-{key}")
+        handle = JobHandle("flow", key, interface, request, task)
         async with self._lock:
             self._jobs[key] = handle
         return handle, updated
@@ -68,18 +84,9 @@ class JobManager:
         interface = self.resolver.resolve_tunnel(request.tunnel_id)
         key = self.tunnel_key(request.tunnel_id)
         updated = await self._stop_key(key, missing_ok=True)
-
-        task = asyncio.create_task(
-            self._tunnel_worker(key, request, interface),
-            name=f"monitor-{key}",
-        )
-        handle = JobHandle(
-            job_type="tunnel",
-            key=key,
-            interface=interface,
-            request=request,
-            task=task,
-        )
+        self.passive.ensure(interface)
+        task = asyncio.create_task(self._tunnel_worker(key, request, interface), name=f"monitor-{key}")
+        handle = JobHandle("tunnel", key, interface, request, task)
         async with self._lock:
             self._jobs[key] = handle
         return handle, updated
@@ -93,12 +100,10 @@ class JobManager:
     async def _stop_key(self, key: str, *, missing_ok: bool) -> bool:
         async with self._lock:
             handle = self._jobs.pop(key, None)
-
         if handle is None:
             if missing_ok:
                 return False
             raise KeyError(key)
-
         handle.task.cancel()
         try:
             await handle.task
@@ -134,157 +139,181 @@ class JobManager:
             job_key=handle.key,
             interface=handle.interface,
             destination_ip=handle.request.destination_ip,
+            bandwidth_destination_ip=handle.request.bandwidth_destination_ip,
             probe_tools=list(handle.request.probe_tools),
             interval_sec=handle.request.interval_sec,
+            state=handle.state,
             started_at=handle.started_at,
             run_count=handle.run_count,
             last_error=handle.last_error,
             last_sample=handle.last_sample,
+            last_passive=handle.last_passive,
         )
 
     async def _flow_worker(self, key: str, request: FlowMonitoringRequest, interface: str) -> None:
         if not self.settings.run_probe_immediately:
             await asyncio.sleep(request.interval_sec)
         while True:
-            await self._run_flow_once(key, request, interface)
+            await self._run_once(key, request, interface, is_flow=True)
             await asyncio.sleep(request.interval_sec)
 
     async def _tunnel_worker(self, key: str, request: TunnelMonitoringRequest, interface: str) -> None:
         if not self.settings.run_probe_immediately:
             await asyncio.sleep(request.interval_sec)
         while True:
-            await self._run_tunnel_once(key, request, interface)
+            await self._run_once(key, request, interface, is_flow=False)
             await asyncio.sleep(request.interval_sec)
 
-    async def _run_flow_once(self, key: str, request: FlowMonitoringRequest, interface: str) -> None:
-        sample = MetricSample()
-        errors: list[str] = []
+    async def _run_once(
+        self,
+        key: str,
+        request: FlowMonitoringRequest | TunnelMonitoringRequest,
+        interface: str,
+        *,
+        is_flow: bool,
+    ) -> None:
+        async with self._lock:
+            handle = self._jobs.get(key)
+            if handle is None:
+                return
+            last_sample = handle.last_sample
+            last_compliance = handle.last_compliance_mono
+            last_bandwidth = handle.last_bandwidth_mono
 
-        if "ping" in request.probe_tools:
-            ping_result = await run_ping(
+        flow_filter = request.flow_filter if isinstance(request, FlowMonitoringRequest) else None
+        passive = await asyncio.to_thread(
+            self.passive.snapshot,
+            interface,
+            request.adaptive.passive_window_sec,
+            flow_filter,
+        )
+
+        now_mono = time.monotonic()
+        decision = self.rule_engine.decide(
+            passive=passive,
+            last_sample=last_sample,
+            slo=request.slo,
+            policy=request.adaptive,
+            seconds_since_compliance=None if last_compliance is None else now_mono - last_compliance,
+            seconds_since_bandwidth=None if last_bandwidth is None else now_mono - last_bandwidth,
+            iperf_requested="iperf3" in request.probe_tools,
+        )
+
+        sample = MetricSample(
+            measurement_state=decision.state,
+            passive_tcp_packets=passive.tcp_packets,
+            passive_tcp_data_segments=passive.tcp_data_segments,
+            passive_retransmissions=passive.retransmissions,
+            passive_retransmission_percent=passive.retransmission_percent,
+            passive_rtt_ms=passive.passive_rtt_ms,
+        )
+        errors: list[str] = []
+        sources: list[str] = []
+
+        if "stamp" in request.probe_tools and self.settings.stamp_enabled:
+            stamp_result = await run_stamp(
                 request.destination_ip,
                 interface,
-                count=self.settings.ping_count,
-                timeout_sec=self.settings.ping_process_timeout_sec,
+                settings=self.settings,
+                clock_checker=self.clock_checker,
+                count=decision.probe_count,
+                spacing_ms=decision.spacing_ms,
             )
-            sample.latency_ms = ping_result.latency_ms
-            sample.jitter_ms = ping_result.jitter_ms
-            sample.loss_percent = ping_result.loss_percent
-            if ping_result.error:
-                errors.append(f"ping: {ping_result.error}")
+            _apply_stamp(sample, stamp_result)
+            sources.append("stamp")
+            if stamp_result.error:
+                errors.append(f"stamp: {stamp_result.error}")
 
-        if "iperf3" in request.probe_tools:
+        # Bandwidth is sampled independently and less frequently than STAMP.
+        if decision.run_bandwidth:
+            target = request.bandwidth_destination_ip or request.destination_ip
             try:
                 source_ip = await self.resolver.get_ipv4_address(interface)
                 iperf_result = await run_iperf3(
-                    request.destination_ip,
+                    target,
                     interface,
                     source_ip,
                     port=self.settings.iperf_port,
                     duration_sec=self.settings.iperf_duration_sec,
                     timeout_sec=self.settings.iperf_process_timeout_sec,
                     bind_device=self.settings.iperf_bind_device,
+                    parallel_streams=self.settings.iperf_parallel_streams,
                 )
                 sample.available_bandwidth_kbps = iperf_result.available_bandwidth_kbps
+                sources.append("iperf3")
                 if iperf_result.error:
                     errors.append(f"iperf3: {iperf_result.error}")
             except Exception as exc:
                 errors.append(f"iperf3: {exc}")
 
-        await self._finalize_run(
-            key,
-            sample,
-            errors,
-            write=lambda: self.writer.write_flow(request, sample),
-        )
+        # Passive RTT is an operational fallback. TCP retransmissions are not converted
+        # into formal packet loss; STAMP remains the active loss measurement source.
+        if sample.latency_ms is None and passive.passive_rtt_ms is not None:
+            sample.latency_ms = passive.passive_rtt_ms
+            sources.append("passive-tcp")
 
-    async def _run_tunnel_once(self, key: str, request: TunnelMonitoringRequest, interface: str) -> None:
-        sample = MetricSample()
-        errors: list[str] = []
+        sample.metric_source = "+".join(dict.fromkeys(sources)) or "passive-tcp"
 
-        if "ping" in request.probe_tools:
-            ping_result = await run_ping(
-                request.destination_ip,
-                interface,
-                count=self.settings.ping_count,
-                timeout_sec=self.settings.ping_process_timeout_sec,
-            )
-            sample.latency_ms = ping_result.latency_ms
-            sample.jitter_ms = ping_result.jitter_ms
-            sample.loss_percent = ping_result.loss_percent
-            if ping_result.error:
-                errors.append(f"ping: {ping_result.error}")
+        if is_flow:
+            write: Callable[[], bool] = lambda: self.writer.write_flow(request, sample)  # type: ignore[arg-type]
+        else:
+            write = lambda: self.writer.write_tunnel(request, sample)  # type: ignore[arg-type]
 
-        if "iperf3" in request.probe_tools:
-            try:
-                source_ip = await self.resolver.get_ipv4_address(interface)
-                iperf_result = await run_iperf3(
-                    request.destination_ip,
-                    interface,
-                    source_ip,
-                    port=self.settings.iperf_port,
-                    duration_sec=self.settings.iperf_duration_sec,
-                    timeout_sec=self.settings.iperf_process_timeout_sec,
-                    bind_device=self.settings.iperf_bind_device,
-                )
-                sample.available_bandwidth_kbps = iperf_result.available_bandwidth_kbps
-                if iperf_result.error:
-                    errors.append(f"iperf3: {iperf_result.error}")
-            except Exception as exc:
-                errors.append(f"iperf3: {exc}")
+        await self._finalize_run(key, sample, passive, errors, write=write)
 
-        if "twamp" in request.probe_tools:
-            twamp_result = await run_twamp(
-                request.destination_ip,
-                interface,
-                command_template=self.settings.twamp_command_template,
-                timeout_sec=self.settings.twamp_process_timeout_sec,
-            )
-            if twamp_result.latency_ms is not None:
-                sample.latency_ms = twamp_result.latency_ms
-            if twamp_result.jitter_ms is not None:
-                sample.jitter_ms = twamp_result.jitter_ms
-            if twamp_result.loss_percent is not None:
-                sample.loss_percent = twamp_result.loss_percent
-            if twamp_result.error:
-                errors.append(f"twamp: {twamp_result.error}")
-
-        await self._finalize_run(
-            key,
-            sample,
-            errors,
-            write=lambda: self.writer.write_tunnel(request, sample),
-        )
+        async with self._lock:
+            handle = self._jobs.get(key)
+            if handle is not None:
+                handle.state = decision.state
+                if decision.state in {"VERIFY", "CRITICAL"}:
+                    handle.last_compliance_mono = time.monotonic()
+                if decision.run_bandwidth:
+                    handle.last_bandwidth_mono = time.monotonic()
 
     async def _finalize_run(
         self,
         key: str,
         sample: MetricSample,
+        passive: PassiveSnapshot,
         errors: list[str],
         *,
         write: Callable[[], bool],
     ) -> None:
-        write_error: str | None = None
         if sample.has_any_metric():
             try:
                 await asyncio.to_thread(write)
             except Exception as exc:
                 LOG.exception("InfluxDB write failed for %s", key)
-                write_error = f"influx: {exc}"
+                errors.append(f"influx: {exc}")
         else:
-            write_error = "no metrics produced"
-
-        if write_error:
-            errors.append(write_error)
+            errors.append("no metrics produced")
 
         async with self._lock:
             handle = self._jobs.get(key)
             if handle is not None:
                 handle.run_count += 1
                 handle.last_sample = sample
+                handle.last_passive = passive
                 handle.last_error = "; ".join(errors) if errors else None
 
         if errors:
             LOG.warning("Monitoring job %s completed with issues: %s", key, "; ".join(errors))
         else:
             LOG.info("Monitoring job %s wrote sample %s", key, sample.model_dump(mode="json"))
+
+
+def _apply_stamp(sample: MetricSample, result) -> None:
+    sample.latency_ms = result.latency_ms
+    sample.jitter_ms = result.jitter_ms
+    sample.loss_percent = result.loss_percent
+    sample.forward_delay_ms = result.forward_delay_ms
+    sample.reverse_delay_ms = result.reverse_delay_ms
+    sample.rtt_ms = result.rtt_ms
+    sample.forward_jitter_ms = result.forward_jitter_ms
+    sample.reverse_jitter_ms = result.reverse_jitter_ms
+    sample.round_trip_loss_percent = result.round_trip_loss_percent
+    sample.forward_loss_percent = result.forward_loss_percent
+    sample.reverse_loss_percent = result.reverse_loss_percent
+    sample.active_probe_count = result.sent
+    sample.received_probe_count = result.received
+    sample.clock_synchronized = result.clock_synchronized

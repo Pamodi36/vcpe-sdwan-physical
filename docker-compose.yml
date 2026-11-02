@@ -65,6 +65,8 @@ services:
       # Monitoring also uses host networking.
       # --------------------------------------------------------
       - MONITORING_URL=http://host.docker.internal:9100
+      - 'MONITORING_UNDERLAY_TARGETS_JSON=${MONITORING_UNDERLAY_TARGETS_JSON}'
+      - 'MONITORING_TUNNEL_TARGETS_JSON=${MONITORING_TUNNEL_TARGETS_JSON}'
 
       # --------------------------------------------------------
       # InfluxDB
@@ -76,10 +78,9 @@ services:
       - INFLUX_ORG=thesis
       - INFLUX_TOKEN=${INFLUX_TOKEN}
 
-      # Keep fake for now.
-      # Change to real/influx mode once Metric Reader integration
-      # is implemented and tested.
-      - METRIC_READER_MODE=fake
+      # Read real monitoring metrics from InfluxDB.
+      - METRIC_READER_MODE=influxdb
+      - METRIC_STALE_AFTER_SEC=30
 
       # --------------------------------------------------------
       # External SD-WAN Controller

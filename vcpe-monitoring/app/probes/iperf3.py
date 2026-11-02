@@ -28,8 +28,7 @@ def parse_iperf3_json(output: str) -> IperfResult:
         if isinstance(value, (int, float)):
             return IperfResult(round(float(value) / 1000.0, 3))
 
-    error = payload.get("error")
-    return IperfResult(None, error=str(error or "iperf3 result contains no bandwidth value"))
+    return IperfResult(None, error=str(payload.get("error") or "iperf3 returned no bandwidth value"))
 
 
 async def run_iperf3(
@@ -41,11 +40,14 @@ async def run_iperf3(
     duration_sec: int,
     timeout_sec: float,
     bind_device: bool,
+    parallel_streams: int = 1,
 ) -> IperfResult:
     args = [
         "iperf3", "-c", destination_ip, "-p", str(port), "-J",
         "-t", str(duration_sec), "-B", source_ip,
     ]
+    if parallel_streams > 1:
+        args.extend(["-P", str(parallel_streams)])
     if bind_device:
         args.extend(["--bind-dev", interface])
 

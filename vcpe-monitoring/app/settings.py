@@ -14,12 +14,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
-    return int(raw) if raw is not None and raw != "" else default
+    return int(raw) if raw not in (None, "") else default
 
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
-    return float(raw) if raw is not None and raw != "" else default
+    return float(raw) if raw not in (None, "") else default
 
 
 def _load_wan_map(raw: str | None) -> dict[str, str]:
@@ -49,33 +49,29 @@ class Settings:
 
     wan_link_map: dict[str, str] = field(default_factory=dict)
 
-    ping_count: int = 4
-    ping_process_timeout_sec: float = 10.0
+    # STAMP / RFC 8762 base unauthenticated mode.
+    stamp_enabled: bool = True
+    stamp_port: int = 862
+    stamp_reply_wait_ms: int = 1000
+    stamp_clock_sync_check: bool = True
+    stamp_assume_clock_synced: bool = False
+    stamp_error_scale: int = 10
+    stamp_error_multiplier: int = 4
 
+    # Passive TCP observation.
+    passive_enabled: bool = True
+    passive_max_events: int = 100_000
+
+    # iperf3 bandwidth measurement. The local server is optional but convenient in
+    # a two-CPE lab because every peer automatically exposes a measurement endpoint.
     iperf_port: int = 5201
     iperf_duration_sec: int = 3
     iperf_process_timeout_sec: float = 12.0
     iperf_bind_device: bool = True
-
-    # TWAMP stays an external adapter until a real client/reflector is selected.
-    twamp_command_template: str = ""
-    twamp_process_timeout_sec: float = 15.0
-
-    # MEF 105-aligned model. These values do not claim MEF compliance.
-    mef105_calculation_interval_sec: int = 5
-    mef105_delay_threshold_ms: float = 80.0
-    mef105_delay_variation_threshold_ms: float = 20.0
-    mef105_loss_ratio_threshold: float = 0.02
-    mef105_recent_tca_limit: int = 200
-
-    otel_enabled: bool = True
-    otel_service_name: str = "vcpe-monitoring"
-    otel_metrics_endpoint: str = "http://127.0.0.1:4318/v1/metrics"
-    otel_export_interval_ms: int = 5000
-    otel_collector_health_url: str = "http://127.0.0.1:13133/"
-    otel_collector_config: str = "/etc/otel/collector-config.yaml"
-    otel_collector_binary: str = "/usr/local/bin/otelcol-contrib"
-    otel_collector_start_timeout_sec: float = 20.0
+    iperf_parallel_streams: int = 1
+    iperf_server_enabled: bool = True
+    iperf_server_port: int = 5201
+    iperf_server_bind: str = "0.0.0.0"
 
     run_probe_immediately: bool = True
     log_level: str = "INFO"
@@ -91,39 +87,23 @@ class Settings:
             influx_token=os.getenv("INFLUX_TOKEN", ""),
             influx_enabled=_env_bool("INFLUX_ENABLED", True),
             wan_link_map=_load_wan_map(os.getenv("WAN_LINK_MAP_JSON")),
-            ping_count=_env_int("PING_COUNT", 4),
-            ping_process_timeout_sec=_env_float("PING_PROCESS_TIMEOUT_SEC", 10.0),
+            stamp_enabled=_env_bool("STAMP_ENABLED", True),
+            stamp_port=_env_int("STAMP_PORT", 862),
+            stamp_reply_wait_ms=_env_int("STAMP_REPLY_WAIT_MS", 1000),
+            stamp_clock_sync_check=_env_bool("STAMP_CLOCK_SYNC_CHECK", True),
+            stamp_assume_clock_synced=_env_bool("STAMP_ASSUME_CLOCK_SYNCED", False),
+            stamp_error_scale=_env_int("STAMP_ERROR_SCALE", 10),
+            stamp_error_multiplier=_env_int("STAMP_ERROR_MULTIPLIER", 4),
+            passive_enabled=_env_bool("PASSIVE_ENABLED", True),
+            passive_max_events=_env_int("PASSIVE_MAX_EVENTS", 100_000),
             iperf_port=_env_int("IPERF_PORT", 5201),
             iperf_duration_sec=_env_int("IPERF_DURATION_SEC", 3),
             iperf_process_timeout_sec=_env_float("IPERF_PROCESS_TIMEOUT_SEC", 12.0),
             iperf_bind_device=_env_bool("IPERF_BIND_DEVICE", True),
-            twamp_command_template=os.getenv("TWAMP_COMMAND_TEMPLATE", ""),
-            twamp_process_timeout_sec=_env_float("TWAMP_PROCESS_TIMEOUT_SEC", 15.0),
-            mef105_calculation_interval_sec=_env_int("MEF105_CALCULATION_INTERVAL_SEC", 5),
-            mef105_delay_threshold_ms=_env_float("MEF105_DELAY_THRESHOLD_MS", 80.0),
-            mef105_delay_variation_threshold_ms=_env_float(
-                "MEF105_DELAY_VARIATION_THRESHOLD_MS", 20.0
-            ),
-            mef105_loss_ratio_threshold=_env_float("MEF105_LOSS_RATIO_THRESHOLD", 0.02),
-            mef105_recent_tca_limit=_env_int("MEF105_RECENT_TCA_LIMIT", 200),
-            otel_enabled=_env_bool("OTEL_ENABLED", True),
-            otel_service_name=os.getenv("OTEL_SERVICE_NAME", "vcpe-monitoring"),
-            otel_metrics_endpoint=os.getenv(
-                "OTEL_METRICS_ENDPOINT", "http://127.0.0.1:4318/v1/metrics"
-            ),
-            otel_export_interval_ms=_env_int("OTEL_EXPORT_INTERVAL_MS", 5000),
-            otel_collector_health_url=os.getenv(
-                "OTEL_COLLECTOR_HEALTH_URL", "http://127.0.0.1:13133/"
-            ),
-            otel_collector_config=os.getenv(
-                "OTEL_COLLECTOR_CONFIG", "/etc/otel/collector-config.yaml"
-            ),
-            otel_collector_binary=os.getenv(
-                "OTEL_COLLECTOR_BINARY", "/usr/local/bin/otelcol-contrib"
-            ),
-            otel_collector_start_timeout_sec=_env_float(
-                "OTEL_COLLECTOR_START_TIMEOUT_SEC", 20.0
-            ),
+            iperf_parallel_streams=_env_int("IPERF_PARALLEL_STREAMS", 1),
+            iperf_server_enabled=_env_bool("IPERF_SERVER_ENABLED", True),
+            iperf_server_port=_env_int("IPERF_SERVER_PORT", 5201),
+            iperf_server_bind=os.getenv("IPERF_SERVER_BIND", "0.0.0.0"),
             run_probe_immediately=_env_bool("RUN_PROBE_IMMEDIATELY", True),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )

@@ -52,10 +52,8 @@ class InterfaceResolver:
                     local = address.get("local")
                     if local:
                         return str(local)
-
         for record in records:
             for address in record.get("addr_info", []):
                 if address.get("family") == "inet" and address.get("local"):
                     return str(address["local"])
-
         raise InterfaceResolutionError(f"interface {interface} has no IPv4 address")

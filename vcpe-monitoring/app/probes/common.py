@@ -27,9 +27,7 @@ async def run_command(args: list[str], timeout_sec: float) -> CommandResult:
     except asyncio.TimeoutError as exc:
         if process.returncode is None:
             process.kill()
-            stdout, stderr = await process.communicate()
-        else:
-            stdout, stderr = b"", b""
+            await process.communicate()
         raise TimeoutError(f"command timed out after {timeout_sec}s: {' '.join(args)}") from exc
 
     return CommandResult(

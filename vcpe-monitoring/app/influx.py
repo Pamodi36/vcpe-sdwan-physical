@@ -9,6 +9,8 @@ LOG = logging.getLogger(__name__)
 
 
 class InfluxWriter:
+    """Writes the legacy Agent contract plus optional numeric extension fields."""
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.enabled = bool(
@@ -20,18 +22,12 @@ class InfluxWriter:
         )
         self._client = None
         self._write_api = None
-
         if not self.enabled:
             LOG.warning("InfluxDB writer disabled or incomplete configuration")
             return
 
-        try:
-            from influxdb_client import InfluxDBClient
-            from influxdb_client.client.write_api import SYNCHRONOUS
-        except ImportError as exc:
-            raise RuntimeError(
-                "influxdb-client is required when INFLUX_ENABLED=true"
-            ) from exc
+        from influxdb_client import InfluxDBClient
+        from influxdb_client.client.write_api import SYNCHRONOUS
 
         self._client = InfluxDBClient(
             url=settings.influx_url,
@@ -54,33 +50,24 @@ class InfluxWriter:
             return False
 
     def write_flow(self, request: FlowMonitoringRequest, sample: MetricSample) -> bool:
-        if not self.enabled:
-            LOG.info(
-                "Influx disabled: flow sample flow_id=%s wan_link=%s sample=%s",
-                request.flow_id,
-                request.wan_link,
-                sample.model_dump(mode="json"),
-            )
-            return False
-        return self._write_point(
-            measurement="sdwan_flow_metrics",
-            tags={"flow_id": request.flow_id, "wan_link": request.wan_link},
-            sample=sample,
+        return self._write_or_log(
+            "sdwan_flow_metrics",
+            {"flow_id": request.flow_id, "wan_link": request.wan_link},
+            sample,
         )
 
     def write_tunnel(self, request: TunnelMonitoringRequest, sample: MetricSample) -> bool:
-        if not self.enabled:
-            LOG.info(
-                "Influx disabled: tunnel sample tunnel_id=%s sample=%s",
-                request.tunnel_id,
-                sample.model_dump(mode="json"),
-            )
-            return False
-        return self._write_point(
-            measurement="sdwan_tunnel_metrics",
-            tags={"tunnel_id": request.tunnel_id},
-            sample=sample,
+        return self._write_or_log(
+            "sdwan_tunnel_metrics",
+            {"tunnel_id": request.tunnel_id},
+            sample,
         )
+
+    def _write_or_log(self, measurement: str, tags: dict[str, str], sample: MetricSample) -> bool:
+        if not self.enabled:
+            LOG.info("Influx disabled: %s tags=%s sample=%s", measurement, tags, sample.model_dump(mode="json"))
+            return False
+        return self._write_point(measurement, tags, sample)
 
     def _write_point(self, measurement: str, tags: dict[str, str], sample: MetricSample) -> bool:
         if not sample.has_any_metric():
@@ -93,15 +80,28 @@ class InfluxWriter:
         for key, value in tags.items():
             point = point.tag(key, str(value))
 
-        for field_name in (
-            "latency_ms",
-            "jitter_ms",
-            "loss_percent",
-            "available_bandwidth_kbps",
-        ):
+        numeric_fields = (
+            # Legacy contract - DO NOT RENAME.
+            "latency_ms", "jitter_ms", "loss_percent", "available_bandwidth_kbps",
+            # Extensions.
+            "forward_delay_ms", "reverse_delay_ms", "rtt_ms",
+            "forward_jitter_ms", "reverse_jitter_ms",
+            "round_trip_loss_percent", "forward_loss_percent", "reverse_loss_percent",
+            "passive_tcp_packets", "passive_tcp_data_segments", "passive_retransmissions",
+            "passive_retransmission_percent", "passive_rtt_ms",
+            "active_probe_count", "received_probe_count",
+        )
+        for field_name in numeric_fields:
             value = getattr(sample, field_name)
             if value is not None:
                 point = point.field(field_name, float(value))
+
+        if sample.clock_synchronized is not None:
+            point = point.field("clock_synchronized", bool(sample.clock_synchronized))
+        if sample.measurement_state:
+            point = point.tag("measurement_state", sample.measurement_state)
+        if sample.metric_source:
+            point = point.tag("metric_source", sample.metric_source)
 
         point = point.time(sample.timestamp, WritePrecision.NS)
         self._write_api.write(

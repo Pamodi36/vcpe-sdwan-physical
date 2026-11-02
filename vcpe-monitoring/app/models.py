@@ -4,23 +4,82 @@ import ipaddress
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
-UnderlayProbeTool = Literal["ping", "iperf3"]
-TunnelProbeTool = Literal["ping", "iperf3", "twamp"]
+ProbeTool = Literal["passive", "stamp", "iperf3"]
+
+
+class FlowFilter(BaseModel):
+    src_prefix: str | None = None
+    dst_prefix: str | None = None
+    protocol: Literal["tcp", "udp", "any"] = "tcp"
+    src_port: int | None = Field(default=None, ge=0, le=65535)
+    dst_port: int | None = Field(default=None, ge=0, le=65535)
+
+    @field_validator("src_prefix", "dst_prefix")
+    @classmethod
+    def validate_prefix(cls, value: str | None) -> str | None:
+        if value in (None, "", "any"):
+            return None
+        ipaddress.ip_network(value, strict=False)
+        return value
+
+
+class SLOPolicy(BaseModel):
+    max_latency_ms: float | None = Field(default=None, ge=0)
+    max_jitter_ms: float | None = Field(default=None, ge=0)
+    max_loss_percent: float | None = Field(default=None, ge=0, le=100)
+    min_bandwidth_kbps: float | None = Field(default=None, ge=0)
+
+
+class AdaptivePolicy(BaseModel):
+    enabled: bool = True
+    passive_window_sec: int = Field(default=10, ge=1, le=600)
+    passive_min_tcp_packets: int = Field(default=200, ge=0, le=1_000_000)
+    warning_ratio: float = Field(default=0.80, gt=0, le=1)
+
+    stable_probe_count: int = Field(default=10, ge=1, le=100_000)
+    stable_probe_spacing_ms: float = Field(default=200.0, ge=0.1, le=60_000)
+    low_traffic_probe_count: int = Field(default=50, ge=1, le=100_000)
+    low_traffic_probe_spacing_ms: float = Field(default=100.0, ge=0.1, le=60_000)
+    warning_probe_count: int = Field(default=200, ge=1, le=100_000)
+    warning_probe_spacing_ms: float = Field(default=20.0, ge=0.1, le=60_000)
+
+    # Low-loss verification window. 2000 probes over 10 s gives 0.05 percentage-point
+    # granularity and can verify an SLO such as loss < 0.5% with much better resolution
+    # than one sparse probe every few seconds.
+    compliance_probe_count: int = Field(default=2000, ge=10, le=100_000)
+    compliance_window_sec: float = Field(default=10.0, ge=0.1, le=600)
+    compliance_interval_sec: int = Field(default=10, ge=1, le=86_400)
+
+    passive_retrans_warning_percent: float = Field(default=1.0, ge=0, le=100)
+
+    # iperf3 is intentionally sampled less frequently because it creates a much heavier
+    # active load than STAMP. The interval can be reduced while the path is degraded.
+    bandwidth_interval_sec: int = Field(default=60, ge=1, le=86_400)
+    bandwidth_warning_interval_sec: int = Field(default=30, ge=1, le=86_400)
+    bandwidth_critical_interval_sec: int = Field(default=10, ge=1, le=86_400)
 
 
 class FlowMonitoringRequest(BaseModel):
     flow_id: str = Field(min_length=1, max_length=128)
     wan_link: str = Field(min_length=1, max_length=128)
     destination_ip: str
-    probe_tools: list[UnderlayProbeTool] = Field(min_length=1)
-    interval_sec: int = Field(ge=1, le=86400)
+    # Optional dedicated measurement node for iperf3. This is useful when the user/app
+    # destination does not run an iperf3 server.
+    bandwidth_destination_ip: str | None = None
+    probe_tools: list[ProbeTool] = Field(default_factory=lambda: ["passive", "stamp"])
+    interval_sec: int = Field(default=5, ge=1, le=86400)
+    flow_filter: FlowFilter | None = None
+    slo: SLOPolicy = Field(default_factory=SLOPolicy)
+    adaptive: AdaptivePolicy = Field(default_factory=AdaptivePolicy)
 
-    @field_validator("destination_ip")
+    @field_validator("destination_ip", "bandwidth_destination_ip")
     @classmethod
-    def validate_destination_ip(cls, value: str) -> str:
+    def validate_destination_ip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         ipaddress.ip_address(value)
         return value
 
@@ -33,12 +92,17 @@ class FlowMonitoringRequest(BaseModel):
 class TunnelMonitoringRequest(BaseModel):
     tunnel_id: str = Field(min_length=1, max_length=128)
     destination_ip: str
-    probe_tools: list[TunnelProbeTool] = Field(min_length=1)
-    interval_sec: int = Field(default=600, ge=1, le=86400)
+    bandwidth_destination_ip: str | None = None
+    probe_tools: list[ProbeTool] = Field(default_factory=lambda: ["passive", "stamp", "iperf3"])
+    interval_sec: int = Field(default=5, ge=1, le=86400)
+    slo: SLOPolicy = Field(default_factory=SLOPolicy)
+    adaptive: AdaptivePolicy = Field(default_factory=AdaptivePolicy)
 
-    @field_validator("destination_ip")
+    @field_validator("destination_ip", "bandwidth_destination_ip")
     @classmethod
-    def validate_destination_ip(cls, value: str) -> str:
+    def validate_destination_ip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         ipaddress.ip_address(value)
         return value
 
@@ -48,13 +112,43 @@ class TunnelMonitoringRequest(BaseModel):
         return list(dict.fromkeys(value))
 
 
+class PassiveSnapshot(BaseModel):
+    tcp_packets: int = 0
+    tcp_data_segments: int = 0
+    retransmissions: int = 0
+    retransmission_percent: float | None = None
+    passive_rtt_ms: float | None = None
+
+
 class MetricSample(BaseModel):
-    # Legacy diagnostic fields consumed by the original Agent MetricReader.
-    # latency_ms is RTT-derived and is NOT interpreted as MEF 105 one-way delay.
+    # Legacy contract consumed by the existing Agent MetricReader. DO NOT RENAME.
     latency_ms: float | None = None
     jitter_ms: float | None = None
     loss_percent: float | None = None
     available_bandwidth_kbps: float | None = None
+
+    # Additional observability fields. Existing MetricReader can ignore them.
+    forward_delay_ms: float | None = None
+    reverse_delay_ms: float | None = None
+    rtt_ms: float | None = None
+    forward_jitter_ms: float | None = None
+    reverse_jitter_ms: float | None = None
+    round_trip_loss_percent: float | None = None
+    forward_loss_percent: float | None = None
+    reverse_loss_percent: float | None = None
+
+    passive_tcp_packets: int | None = None
+    passive_tcp_data_segments: int | None = None
+    passive_retransmissions: int | None = None
+    passive_retransmission_percent: float | None = None
+    passive_rtt_ms: float | None = None
+
+    active_probe_count: int | None = None
+    received_probe_count: int | None = None
+    clock_synchronized: bool | None = None
+    measurement_state: str | None = None
+    metric_source: str | None = None
+
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     def has_any_metric(self) -> bool:
@@ -65,6 +159,10 @@ class MetricSample(BaseModel):
                 self.jitter_ms,
                 self.loss_percent,
                 self.available_bandwidth_kbps,
+                self.forward_delay_ms,
+                self.reverse_delay_ms,
+                self.rtt_ms,
+                self.passive_retransmission_percent,
             )
         )
 
@@ -82,91 +180,12 @@ class JobView(BaseModel):
     job_key: str
     interface: str
     destination_ip: str
+    bandwidth_destination_ip: str | None = None
     probe_tools: list[str]
     interval_sec: int
+    state: str = "starting"
     started_at: datetime
     run_count: int = 0
     last_error: str | None = None
     last_sample: MetricSample | None = None
-
-
-def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("timestamp must include timezone information")
-    return value.astimezone(timezone.utc)
-
-
-class MonitoredEntity(BaseModel):
-    entity_id: str = Field(min_length=1, max_length=128)
-    entity_type: Literal["tvc", "application-flow", "path"] = "tvc"
-    source_cpe: str | None = Field(default=None, max_length=128)
-    destination_cpe: str | None = Field(default=None, max_length=128)
-    source_uplink: str | None = Field(default=None, max_length=128)
-    destination_uplink: str | None = Field(default=None, max_length=128)
-    direction: str = Field(min_length=1, max_length=128)
-    cos_name: str | None = Field(default=None, max_length=128)
-
-
-class OneWaySample(BaseModel):
-    sequence_number: int = Field(ge=0)
-    tx_timestamp_utc: datetime
-    rx_timestamp_utc: datetime | None = None
-    received: bool = True
-
-    @field_validator("tx_timestamp_utc", "rx_timestamp_utc")
-    @classmethod
-    def require_utc_aware(cls, value: datetime | None) -> datetime | None:
-        return None if value is None else _utc(value)
-
-    @model_validator(mode="after")
-    def validate_receive_timestamp(self):
-        if self.received and self.rx_timestamp_utc is None:
-            raise ValueError("rx_timestamp_utc is required when received=true")
-        if (
-            self.received
-            and self.rx_timestamp_utc is not None
-            and self.rx_timestamp_utc < self.tx_timestamp_utc
-        ):
-            raise ValueError("rx_timestamp_utc cannot be earlier than tx_timestamp_utc")
-        return self
-
-    @property
-    def one_way_delay_ms(self) -> float | None:
-        if not self.received or self.rx_timestamp_utc is None:
-            return None
-        return (self.rx_timestamp_utc - self.tx_timestamp_utc).total_seconds() * 1000.0
-
-
-class OneWaySampleBatch(BaseModel):
-    entity: MonitoredEntity
-    samples: list[OneWaySample] = Field(min_length=1)
-    calculation_interval_sec: int | None = Field(default=None, ge=1, le=3600)
-
-
-class Mef105WindowMetrics(BaseModel):
-    # "aligned with MEF 105" semantics; not a statement of formal compliance.
-    entity: MonitoredEntity
-    window_start_utc: datetime
-    window_end_utc: datetime
-    calculation_interval_sec: int
-    sent_packets: int
-    received_packets: int
-    one_way_mean_packet_delay_ms: float | None = None
-    one_way_mean_inter_packet_delay_variation_ms: float | None = None
-    one_way_packet_loss_ratio: float
-
-
-TcaMetric = Literal[
-    "one_way_mean_packet_delay_ms",
-    "one_way_mean_inter_packet_delay_variation_ms",
-    "one_way_packet_loss_ratio",
-]
-
-
-class ThresholdCrossingAlert(BaseModel):
-    entity: MonitoredEntity
-    metric: TcaMetric
-    status: Literal["SET", "CLEAR"]
-    threshold: float
-    value: float
-    timestamp_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_passive: PassiveSnapshot | None = None
