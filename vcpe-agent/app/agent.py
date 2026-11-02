@@ -2347,51 +2347,28 @@ class Agent:
         
         
             for tunnel_id, item in tunnel_delete_groups.items():
-        
-                parent_dict = item["parent_dict"]                                                     # full old tunnel configuration
-                deleted_leafs = item["deleted_leafs"]                                                 # all deleted tunnel children in this transaction
-        
-                expected_leafs = {
-                    key
-                    for key in parent_dict.keys()
-                    if key != "name"
-                }                                                                                     # all old tunnel children except the list key
-        
-                if expected_leafs and expected_leafs.issubset(deleted_leafs):                         # all old tunnel children disappeared together
-        
-                    logging.info("Detected complete tunnel deletion: %s",tunnel_id)                   # complete list-entry deletion detected
-        
-                    operations.extend(
-                        self._build_operations_from_object("tunnel", parent_dict, ["*"], delete=True))       # generate Forwarder DELETE for route and WireGuard tunnel
-        
-                    monitoring_stop_candidates.append({
-                        "object_type": "tunnel",
-                        "parent_dict": parent_dict
-                    })                                                                                # stop tunnel monitoring after successful commit
+                parent_dict = item["parent_dict"]
+                deleted_leafs = item["deleted_leafs"]
 
-                    deleted_tunnel_candidates.append(tunnel_id)                                       # defer local key deletion until commit succeeds
-        
-                else:
-                    deleted_allowed_prefixes = []
-                    other_tunnel_deleted_nodes = []
-                
-                    for node in item["nodes"]:
-                
-                        data = node.find("data")
-                        deleted_xml = self._first_child(data)
-                
-                        if deleted_xml is None:
-                            continue
-                
-                        deleted_type = self._local_name(deleted_xml.tag)
-                
-                        if deleted_type == "allowed-prefix":
-                
-                            deleted_prefix = (deleted_xml.text or "").strip()
-                
-                            if deleted_prefix:
-                                deleted_allowed_prefixes.append(deleted_prefix)
-                
+                deleted_allowed_prefixes = []
+                other_tunnel_deleted_nodes = []
+                    
+                for node in item["nodes"]:
+                    data = node.find("data")
+                    deleted_xml = self._first_child(data)
+                    
+                    if deleted_xml is None:
+                         continue
+                    
+                    deleted_type = self._local_name(deleted_xml.tag)
+                    
+                    if deleted_type == "allowed-prefix":
+                    
+                        deleted_prefix = (deleted_xml.text or "").strip()
+                    
+                        if deleted_prefix:
+                            deleted_allowed_prefixes.append(deleted_prefix)
+                    
                         else:
                             other_tunnel_deleted_nodes.append(node)
                 
@@ -2475,11 +2452,16 @@ class Agent:
                     parent_dict = self._xml_to_dict(deleted_xml)                                      # convert deleted object into Python dict
         
                     if object_type in ["class", "tunnel"]:
-        
                         monitoring_stop_candidates.append({
                             "object_type": object_type,
                             "parent_dict": parent_dict
                         })                                                                            # stop monitoring after successful commit
+
+                    if object_type == "tunnel":                                                      
+                        tunnel_id = parent_dict.get("name")
+
+                        if tunnel_id and tunnel_id not in deleted_tunnel_candidates:
+                            deleted_tunnel_candidates.append(tunnel_id)                               # Schedule key cleanup for complete tunnel deletion 
                 
         forwarder_result = None
 
