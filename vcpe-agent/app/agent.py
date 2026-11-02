@@ -2488,6 +2488,8 @@ class Agent:
                 operations=operations,
                 validate_only=validate_only)                                                           # send transaction only when Forwarder operations exist
 
+        logging.info("DEBUG phase=%s, deleted_tunnel_candidates=%s", phase, deleted_tunnel_candidates) # Check which tunnels were identified for permanent deletion
+
         if phase == "commit":
             for wan in nat_detection_candidates:
         
