@@ -96,14 +96,8 @@ class MetricReader:
                 "loss_percent": 0.1,
                 "available_bandwidth_kbps": 60000
             },
-            ("261", "UPL1"): {
-                "latency_ms": 25,
-                "jitter_ms": 4,
-                "loss_percent": 0.2,
-                "available_bandwidth_kbps": 45000
-            },
         
-            ("261", "UPL2"): {
+            ("260", "UPL2"): {
                 "latency_ms": 30,
                 "jitter_ms": 5,
                 "loss_percent": 0.3,
