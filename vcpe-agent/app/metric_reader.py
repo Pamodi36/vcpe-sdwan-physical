@@ -14,7 +14,8 @@ class MetricReader:
         self.influx_org = os.environ["INFLUX_ORG"]              
         self.influx_bucket = os.environ["INFLUX_BUCKET"]     
 
-        self.reader_mode = os.getenv("METRIC_READER_MODE", "influxdb")                         # use "fake" for dry run, "influxdb" for real InfluxDB
+        #self.reader_mode = os.getenv("METRIC_READER_MODE", "influxdb")                         # UNCOMMENT WHEN INFLUXDB IS READY
+        self.reader_mode = "fake"                                                               # Temporarily use fake metrics until InfluxDB is ready
 
         self.stale_after_sec = int(os.getenv("METRIC_STALE_AFTER_SEC", "15"))                  # metric older than this becomes stale (15 sec)
 
