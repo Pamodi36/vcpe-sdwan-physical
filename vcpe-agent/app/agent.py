@@ -1699,8 +1699,9 @@ class Agent:
     
                     flow_id = self.flow_id_fwmarks.get(class_name)                         # get real fwmark from forwarder result
     
-                    if flow_id is None:                                                    # if forwarder has not returned fwmark yet
-                        flow_id = self._assign_temporary_fake_fwmark(class_name)            # use temporary fake fwmark for monitoring
+                    if flow_id is None:
+                        logging.warning("Cannot start monitoring for class=%s because Forwarder fwmark is not available yet", class_name)
+                        return
     
                     wan_names = []                                                         # list of WAN candidates used by this policy
     
@@ -1755,7 +1756,8 @@ class Agent:
                 flow_id = self.flow_id_fwmarks.get(class_name)                                      # get fwmark/flow_id for this class
             
                 if flow_id is None:                                                                 # if forwarder has not returned fwmark yet
-                    flow_id = self._assign_temporary_fake_fwmark(class_name)                        # use temporary fake fwmark
+                    logging.warning("Cannot stop monitoring for class=%s because Forwarder fwmark is not available yet", class_name)
+                    return
             
                 current_config = self.current_config_cache
                 policies = current_config.get("policy", {}).get("steering", [])                    # read steering policies
@@ -2901,7 +2903,8 @@ class Agent:
                 flow_id = self.flow_id_fwmarks.get(traffic_class)
             
                 if flow_id is None:
-                    flow_id = self._assign_temporary_fake_fwmark(traffic_class)
+                    logging.warning("Skipping underlay metric lookup for class=%s because fwmark is unavailable", traffic_class)
+                    continue
             
                 flow_state_map.setdefault(traffic_class, {})
             
