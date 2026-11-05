@@ -435,6 +435,12 @@
             description "Peer WireGuard Public Key";
           }
 
+          leaf peer-local-address {
+              type inet:ip-address;
+              description
+                "Remote peer tunnel-side IP address used for overlay monitoring.";
+          }
+
           leaf-list allowed-prefix {
             type inet:ip-prefix;
             min-elements 1;
