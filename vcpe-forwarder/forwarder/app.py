@@ -56,8 +56,9 @@ def create_app(
     @app.on_event("startup")
     def reconcile_runtime_services() -> None:
         # state.json survives container/router restart; dnsmasq/pid/config do not.
-        # Repair only service runtime here.  Do not replay interfaces, WireGuard,
-        # routing or nftables. A later Agent transaction will retry as well because
+        # Restore services and the BE WAN list/default here. Do not replay
+        # interfaces, WireGuard, marked routing tables or nftables. An Agent
+        # transaction will retry service restoration as well because
         # _render_services performs the same health check for unchanged DHCP state.
         try:
             service.reconcile_runtime_services()

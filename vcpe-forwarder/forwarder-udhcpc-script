@@ -8,13 +8,14 @@
 #   - Keep ONE management default route in main (default: ens5) so the vCPE host
 #     can reach Git/apt/Docker without interfering with SD-WAN fwmark tables.
 #   - Persist DHCP information (including DNS) for observability.
+#   - Reconcile the configured-WAN Best Effort ECMP after lease changes.
 #
 # IMPORTANT:
 # DNS for the HOST OS is intentionally not written here. This script runs inside
 # the Forwarder container. Host DNS (/etc/resolv.conf/systemd-resolved) is host
 # userspace configuration, not kernel dataplane state.
 
-set -u
+set -eu
 
 IFACE="${interface:?udhcpc did not provide interface}"
 RUN_DIR=/run/forwarder/dhcp
@@ -61,6 +62,7 @@ case "${1:-}" in
         ;;
 
     bound|renew)
+        cleanup_management_default
         cleanup_old_rule
 
         PREFIX=32
@@ -114,7 +116,16 @@ PY
             echo "TABLE=$TABLE"
             echo "DNS=${dns:-}"
             echo "LEASE=${lease:-}"
-        } > "$LEASE_FILE"
+        } > "$LEASE_FILE.tmp.$$"
+        mv -f "$LEASE_FILE.tmp.$$" "$LEASE_FILE"
+        ;;
+esac
+
+case "${1:-}" in
+    bound|renew|deconfig)
+        # Reads only the renderer-published configured WANs. A stale DHCP hook
+        # cannot add a removed WAN back to the BE nexthops.
+        python3 -m forwarder.best_effort || exit $?
         ;;
 esac
 

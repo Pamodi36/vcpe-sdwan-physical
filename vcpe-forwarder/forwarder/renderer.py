@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shlex
 import ipaddress
 import re
 from pathlib import Path
@@ -88,6 +90,7 @@ class Renderer:
         self._ensure_allocations(current)
         plan = RenderPlan(revision=revision)
         plan.phases = {
+            "best-effort-config": self._publish_best_effort(current, revision, plan),
             "cleanup": self._render_cleanup(previous, current),
             "bridges": self._render_bridges(previous, current),
             "interfaces": self._render_interfaces(current),
@@ -99,15 +102,17 @@ class Renderer:
         return plan
 
     def render_runtime_services(self, current: ForwarderState, revision: str) -> RenderPlan:
-        """Reconcile ephemeral service runtime without replaying the dataplane.
+        """Restore service runtime and the Best Effort default after restart.
 
         state.json is persistent, while dnsmasq processes, pid files and the active
-        /app/etc/forwarder/dnsmasq configs are runtime artifacts.  Re-render only
-        the services phase so a Forwarder/container restart can restore DHCP without
-        touching interfaces, WireGuard, routing or nftables.
+        /app/etc/forwarder/dnsmasq configs are runtime artifacts. Republish the WAN
+        authorization list before DHCP callbacks and reconcile the BE default.
+        Interfaces, WireGuard, marked routing tables and nftables are not replayed.
         """
         plan = RenderPlan(revision=revision)
         plan.phases = {
+            "best-effort-config": self._publish_best_effort(current, revision, plan),
+            "best-effort-routing": ["python3 -m forwarder.best_effort"],
             "services": self._render_services(current, current, revision, plan),
         }
         return plan
@@ -471,7 +476,71 @@ class Renderer:
         # WireGuard peer routes sharing the same destination as one multipath route
         # instead of letting repeated `ip route replace` calls overwrite each other.
         commands.extend(self._render_static_routes(previous, current))
+        commands.append("python3 -m forwarder.best_effort")
         return commands
+
+    @staticmethod
+    def _is_wan_default(route_set_id, route, state: ForwarderState) -> bool:
+        interface = state.interfaces.get(route.out_interface)
+        return (route_set_id.endswith("-default")
+                and route.destination_cidr in {"0.0.0.0/0", "default"}
+                and bool((interface and interface.role == "wan")
+                         or route.out_interface in state.wan_link_map.values()))
+
+    def _best_effort_config(self, state: ForwarderState) -> dict:
+        # Only WANs communicated/resolved by the Agent are eligible for BE.
+        # WAN_LINK_MAP_JSON alone is passive metadata: the interface must also
+        # exist in desired state as an administratively-up WAN.
+        wans = []
+        authorized_devices = sorted(set(state.wan_link_map.values()))
+        for dev in authorized_devices:
+            interface = state.interfaces.get(dev)
+            if (interface is None or interface.role != "wan" or interface.admin_state != "up"
+                    or interface.kind == "wireguard" or dev in state.tunnels):
+                continue
+            defaults = [route for name, route_set in state.static_route_sets.items()
+                        for route in route_set.routes
+                        if self._is_wan_default(name, route, state)
+                        and route.out_interface == dev]
+            defaults.sort(key=lambda r: (r.metric or 0, r.next_hop_ip or ""))
+            route = defaults[0] if defaults else None
+            wans.append({"dev": dev, "mode": interface.address_mode,
+                         "gateway": route.next_hop_ip if route else None,
+                         "direct": bool(route and not route.next_hop_ip)})
+        return {"wans": wans}
+
+    def _publish_best_effort(self, state, revision, plan) -> list[str]:
+        path = f"var/lib/forwarder/rendered/{revision}/best-effort.json"
+        plan.files[path] = json.dumps(self._best_effort_config(state), sort_keys=True)
+        return ["python3 -m forwarder.best_effort --configure "
+                + shlex.quote(str(self.root / path)) + " --publish-only"]
+
+    def _best_effort_nat_rules(self, state: ForwarderState) -> list[str]:
+        devices = [wan["dev"] for wan in self._best_effort_config(state)["wans"]]
+        if not devices:
+            return []
+
+        # Match Giacomo's required semantics: LAN source subnet + configured WAN
+        # egress. Do not depend on iifname because routed bridge traffic can be seen
+        # with the bridge or a member interface depending on the Linux dataplane.
+        lans = {name for name, iface in state.interfaces.items() if iface.role == "lan"}
+        lans.update(state.bridges)
+        lans.update(server.served_interface for server in state.dhcp_servers.values())
+        rules = set()
+        outputs = ", ".join(json.dumps(dev) for dev in devices)
+        for name in sorted(lans):
+            interface = state.interfaces.get(name)
+            if (not interface or interface.admin_state != "up" or interface.role == "wan"
+                    or name in state.tunnels):
+                continue
+            for address in interface.addresses:
+                try:
+                    network = ipaddress.ip_interface(address).network
+                except ValueError:
+                    continue
+                if network.version == 4:
+                    rules.add(f'ip saddr {network} oifname {{ {outputs} }} masquerade')
+        return sorted(rules)
 
     @staticmethod
     def _route_identity(route) -> tuple[str, str | None, str | None, int | None]:
@@ -515,6 +584,8 @@ class Renderer:
             if route_set_id.endswith("-peer-routes"):
                 continue
             for route in route_set.routes:
+                if self._is_wan_default(route_set_id, route, current):
+                    continue
                 current_normal[self._route_identity(route)] = route
 
         # Remove routes that existed before but no longer exist in desired state.
@@ -814,16 +885,18 @@ class Renderer:
             return selected_path
         return self._resolve_wan_interface(selected_path, state)
 
-    def _default_route_command(self, dev: str, route_table: int) -> str:
-        # Use the gateway learned by DHCP/static configuration when present.
-        # Falling back to a device-only route is useful for point-to-point links.
-        return (
-            f"GW=$(ip -4 route show table all default dev {dev} 2>/dev/null "
-            f"| awk '/^default/ {{for(i=1;i<=NF;i++) if($i==\"via\"){{print $(i+1); exit}}}}'); "
-            f"if [ -n \"$GW\" ]; then "
-            f"ip route replace default via \"$GW\" dev {dev} onlink table {route_table}; "
-            f"else ip route replace default dev {dev} table {route_table}; fi"
-        )
+    def _gateway_assignment(self, dev: str, state: ForwarderState) -> str:
+        interface = state.interfaces.get(dev)
+        if interface and interface.role == "wan":
+            return f"GW=$(python3 -m forwarder.best_effort --gateway {shlex.quote(dev)})"
+        return (f"GW=$(ip -4 route show table all default dev {dev} 2>/dev/null "
+                "| awk '/^default/ {for(i=1;i<=NF;i++) if($i==\"via\"){print $(i+1); exit}}')")
+
+    def _default_route_command(self, dev: str, route_table: int, state: ForwarderState) -> str:
+        return (self._gateway_assignment(dev, state) + "; "
+                f'if [ -n "$GW" ]; then '
+                f'ip route replace default via "$GW" dev {dev} onlink table {route_table}; '
+                f'else ip route replace default dev {dev} table {route_table}; fi')
 
     def _route_for_selected_path(
         self, selected_path: str, state: ForwarderState, route_table: int, selected_path_type: str | None = None
@@ -845,15 +918,12 @@ class Renderer:
         if not self._interface_is_usable_for_routing(dev, state):
             return [self._unreachable_default_command(route_table)]
 
-        return [self._default_route_command(dev, route_table)]
+        return [self._default_route_command(dev, route_table, state)]
 
-    def _endpoint_route_command(self, host: str, dev: str) -> str:
-        return (
-            f"GW=$(ip -4 route show table all default dev {dev} 2>/dev/null "
-            f"| awk '/^default/ {{for(i=1;i<=NF;i++) if($i==\"via\"){{print $(i+1); exit}}}}'); "
-            f"if [ -n \"$GW\" ]; then ip route replace {host}/32 via \"$GW\" dev {dev}; "
-            f"else ip route replace {host}/32 dev {dev}; fi"
-        )
+    def _endpoint_route_command(self, host: str, dev: str, state: ForwarderState) -> str:
+        return (self._gateway_assignment(dev, state) + "; "
+                f'if [ -n "$GW" ]; then ip route replace {host}/32 via "$GW" dev {dev}; '
+                f'else ip route replace {host}/32 dev {dev}; fi')
 
     def _route_for_path(self, path: ForwardPath, state: ForwarderState, route_table: int) -> list[str]:
         commands: list[str] = []
@@ -867,12 +937,12 @@ class Renderer:
             peer = state.peers.get(path.tunnel_id, {}).get(path.peer_id)
             host = self._endpoint_host(peer.endpoint if peer else None)
             if host:
-                commands.append(self._endpoint_route_command(host, path.wan_interface))
-            commands.append(self._default_route_command(path.tunnel_id, route_table))
+                commands.append(self._endpoint_route_command(host, path.wan_interface, state))
+            commands.append(self._default_route_command(path.tunnel_id, route_table, state))
         else:
             if not self._interface_is_usable_for_routing(path.wan_interface, state):
                 return [self._unreachable_default_command(route_table)]
-            commands.append(self._default_route_command(path.wan_interface, route_table))
+            commands.append(self._default_route_command(path.wan_interface, route_table, state))
 
         return commands
 
@@ -945,10 +1015,7 @@ class Renderer:
         # placed before the multipath nexthop blocks.
         parts = [f"ROUTE='ip route replace default table {route_table}'"]
         for dev in devices:
-            parts.append(
-                f"GW=$(ip -4 route show table all default dev {dev} 2>/dev/null "
-                f"| awk '/^default/ {{for(i=1;i<=NF;i++) if($i==\"via\"){{print $(i+1); exit}}}}')"
-            )
+            parts.append(self._gateway_assignment(dev, state))
             parts.append(
                 f"if [ -n \"$GW\" ]; then ROUTE=\"$ROUTE nexthop via $GW dev {dev} weight 1\"; "
                 f"else ROUTE=\"$ROUTE nexthop dev {dev} weight 1\"; fi"
@@ -1085,6 +1152,8 @@ class Renderer:
             for rule in self._nat_rules_for_policy(policy, None, "postrouting"):
                 lines.append(f"    {rule}")
 
+        # Fallback after explicit policies; restrict both LAN ingress and WAN egress.
+        lines.extend(f"    {rule}" for rule in self._best_effort_nat_rules(current))
         lines.extend(["  }", "}"])
         return "\n".join(lines) + "\n"
 
