@@ -164,6 +164,10 @@ services:
       - IPERF_PROCESS_TIMEOUT_SEC=12
       - IPERF_BIND_DEVICE=true
 
+      # The host systemd iperf3.service owns TCP/5201.
+      # Monitoring remains an iperf3 client but must not start a second listener.
+      - IPERF_SERVER_ENABLED=false
+
       # No real TWAMP client/reflector is bundled yet.
       - TWAMP_COMMAND_TEMPLATE=
 
