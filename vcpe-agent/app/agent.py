@@ -1052,24 +1052,6 @@ class Agent:
         self.flow_id_fwmarks[traffic_class] = int(fwmark)                                # store fwmark learned from forwarder for monitoring use
         logging.info("Learned fwmark=%s for traffic_class=%s from forwarder", fwmark, traffic_class) # log learned fwmark
 
-    def _assign_temporary_fake_fwmark(self, traffic_class):                               # REMOVE THIS FUNCTION ONCE FWMARK CREATION IS READY IN FORWARDER
-        if not traffic_class:
-            return None
-    
-        if traffic_class in self.flow_id_fwmarks:
-            return self.flow_id_fwmarks[traffic_class]
-    
-        fake_fwmark = 1000 + len(self.flow_id_fwmarks) + 1
-    
-        self.flow_id_fwmarks[traffic_class] = fake_fwmark
-    
-        logging.warning(
-            "Temporary fake fwmark=%s assigned for traffic_class=%s because forwarder did not return fwmark yet",
-            fake_fwmark,
-            traffic_class)
-
-        return fake_fwmark
-
     def _process_forwarder_transaction_result(self, result):
         if not isinstance(result, dict):                                                  # ignore unexpected response format
             return
