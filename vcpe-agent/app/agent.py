@@ -1665,7 +1665,7 @@ class Agent:
                     return                                                                 # stop this monitoring action
     
                 current_config = self.current_config_cache          
-                policies = ([steering_policy] if steering_policy else current_config.get("policy", {}).get("steering", [])   # read steering policies
+                policies = ([steering_policy] if steering_policy else current_config.get("policy", {}).get("steering", []))  # read steering policies
     
                 for policy in self._as_list(policies):                                     # loop through steering policies
                     if policy.get("class") != class_name:                                  # skip policies for other traffic classes
