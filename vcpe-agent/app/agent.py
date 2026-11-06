@@ -1723,7 +1723,7 @@ class Agent:
                 "Failed to start monitoring for object_type=%s object=%s: %s",object_type, parent_dict, e)
             
     def _stop_monitoring_for_object(self, object_type, parent_dict, steering_policy=None, remove_fwmark=False):    # called after Clixon commit to stop monitoring
-            if not hasattr(self, "monitoring_manager"):
+        if not hasattr(self, "monitoring_manager"):
             logging.warning("monitoring_manager not configured")
             return
     
@@ -2153,28 +2153,49 @@ class Agent:
         if changed is not None:
             for change in changed.findall("change"):
                 new_node = change.find("new")
+                old_node = change.find("old")
                 
                 if new_node is None:
                     continue
 
                 changed_leaf = new_node.findtext("node-name")                              # raw YANG node that actually changed
 
-                parent_xml = self._callback_object_xml(                                    # Prefer normalized object-data from the new callback.
+                # ---------------------------------------------------------
+                # NEW object
+                # ---------------------------------------------------------
+                parent_xml = self._callback_object_xml(
                     new_node,
-                    fallback="parent"                                                      # With the old callback, fall back to the existing parent-data behavior.
+                    fallback="parent"
                 )
-                
+
                 if parent_xml is None:
                     continue
-                
-                object_type = self._local_name(parent_xml.tag)                             # class/tunnel/wan-link/lan-link/rule/steering
-                parent_dict = self._xml_to_dict(parent_xml)                               # complete semantic object
 
+                object_type = self._local_name(parent_xml.tag)
+                parent_dict = self._xml_to_dict(parent_xml)
+                
+                new_parent_dict = parent_dict                                     # ADD
+     
+                # ---------------------------------------------------------
+                # OLD object
+                # ---------------------------------------------------------
+                old_parent_dict = {}                                              # ADD
+            
+                if old_node is not None:
+                    old_parent_xml = self._callback_object_xml(
+                        old_node,
+                        fallback="parent"
+                    )
+            
+                    if old_parent_xml is not None:
+                        old_parent_dict = self._xml_to_dict(old_parent_xml)
+            
                 object_name = (
                     parent_dict.get("name")
                     or parent_dict.get("id")
                     or parent_dict.get("class")
-                    or object_type)
+                    or object_type
+                )
 
                 object_key = f"{object_type}:{object_name}"                                    # unique key used to group multiple changed leafs under same object
 
@@ -2182,6 +2203,8 @@ class Agent:
                     changed_objects[object_key] = {
                         "object_type": object_type,
                         "parent_dict": parent_dict,
+                        "new_parent_dict": new_parent_dict,
+                        "old_parent_dict": old_parent_dict,
                         "changed_leafs": []}
                 else:
                     changed_objects[object_key]["parent_dict"] = parent_dict
@@ -2192,6 +2215,8 @@ class Agent:
         for item in changed_objects.values():                                                # after grouping, build operations once per changed object
             object_type = item["object_type"]
             parent_dict = item["parent_dict"]
+            new_parent_dict = item["new_parent_dict"]
+            old_parent_dict = item["old_parent_dict"]
             changed_leafs = item["changed_leafs"]
 
             operations.extend(
@@ -2204,10 +2229,24 @@ class Agent:
             if object_type == "class":
                 monitoring_start_candidates.append({
                     "object_type": "class",
+                    "class_name": parent_dict.get("name"),
                     "parent_dict": parent_dict
                 })
             
             elif object_type == "tunnel":
+                if peer_relationship_changed:
+                    controller_reconcile_needed = True
+            
+                # Start/update tunnel monitoring only if peer information is already valid.
+                # If peer relationship changed, wait for Controller to PATCH resolved-peer.
+                if (
+                    parent_dict.get("resolved-peer")
+                    and not peer_relationship_changed
+                ):
+                    monitoring_start_candidates.append({
+                        "object_type": "tunnel",
+                        "parent_dict": parent_dict
+                    })     
             
                 peer_relationship_changed = any(
                     leaf in changed_leafs
@@ -2241,21 +2280,7 @@ class Agent:
                     monitoring_start_candidates.append({
                         "object_type": "class",
                         "class_name": class_name,
-                    })
-            
-                if peer_relationship_changed:
-                    controller_reconcile_needed = True
-            
-                # Start/update tunnel monitoring only if peer information is already valid.
-                # If peer relationship changed, wait for Controller to PATCH resolved-peer.
-                if (
-                    parent_dict.get("resolved-peer")
-                    and not peer_relationship_changed
-                ):
-                    monitoring_start_candidates.append({
-                        "object_type": "tunnel",
-                        "parent_dict": parent_dict
-                    })                                         
+                    })                                    
             
         added = root.find("added")                                                      # contains newly added datastore objects
         
@@ -2324,6 +2349,7 @@ class Agent:
                     if object_type == "class":
                         monitoring_start_candidates.append({
                             "object_type": "class",
+                            "class_name": parent_dict.get("name"),
                             "parent_dict": parent_dict
                         })
                     
@@ -2554,7 +2580,30 @@ class Agent:
         if phase == "commit":
             for wan in nat_detection_candidates:
         
-                threading.Thread(target=self._wait_for_wan_ready, args=(wan,), daemon=True).start()                                                                       # wait for DHCP without blocking Clixon commit
+                threading.Thread(target=self._wait_for_wan_ready, args=(wan,), daemon=True).start()            # wait for DHCP without blocking Clixon commit
+
+            for item in monitoring_stop_candidates:                                        # stop monitoring only after real commit
+                if item["object_type"] == "class":                                          # traffic class deleted
+                    self._stop_monitoring_for_object(
+                        "class",
+                        item["parent_dict"],
+                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
+                        remove_fwmark=True                                                  # class is really deleted
+                    )
+            
+                elif item["object_type"] == "steering":                                     # steering policy changed
+                    self._stop_monitoring_for_object(
+                        "class",
+                        {"name": item["class_name"]},                                       # class still exists
+                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
+                        remove_fwmark=False                                                 # keep fwmark mapping
+                    )
+            
+                elif item["object_type"] == "tunnel":                                       # tunnel deleted
+                    self._stop_monitoring_for_object(
+                        "tunnel",
+                        item["parent_dict"]
+                    )
 
             for item in monitoring_start_candidates:                                        # start/update monitoring only after real commit
                 if item["object_type"] == "class":                                           # traffic class added/changed or steering changed
@@ -2562,7 +2611,7 @@ class Agent:
                     class_name = item.get("class_name")                                      # get class name
             
                     if class_name:
-                        current_class = None                                                 # default if class not found
+                        current_class = item.get("parent_dict")
             
                         traffic_classes = self.current_config_cache.get(
                             "traffic", {}
@@ -2592,28 +2641,6 @@ class Agent:
                         item["parent_dict"]
                     )
 
-            for item in monitoring_stop_candidates:                                        # stop monitoring only after real commit
-                if item["object_type"] == "class":                                          # traffic class deleted
-                    self._stop_monitoring_for_object(
-                        "class",
-                        item["parent_dict"],
-                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
-                        remove_fwmark=True                                                  # class is really deleted
-                    )
-            
-                elif item["object_type"] == "steering":                                     # steering policy changed
-                    self._stop_monitoring_for_object(
-                        "class",
-                        {"name": item["class_name"]},                                       # class still exists
-                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
-                        remove_fwmark=False                                                 # keep fwmark mapping
-                    )
-            
-                elif item["object_type"] == "tunnel":                                       # tunnel deleted
-                    self._stop_monitoring_for_object(
-                        "tunnel",
-                        item["parent_dict"]
-                    )
 
             for tunnel_id in deleted_tunnel_candidates:
                 self._delete_wireguard_tunnel_keys(tunnel_id)                                # delete private/public key files and runtime key cache after committed tunnel deletion
