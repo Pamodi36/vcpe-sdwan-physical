@@ -94,9 +94,6 @@ class MonitoringManager:
         resolved_peer = tunnel.get("resolved-peer", {})                                
         destination_ip = resolved_peer.get("peer-local-address")                                # use peer local WG tunnel address as tunnel monitoring destination
 
-        if not tunnel_id:                                                              
-            raise ValueError("Cannot start tunnel monitoring without tunnel name")       
-
         if not destination_ip:                                                           
             raise ValueError("Cannot start tunnel monitoring without peer-address")  
 
