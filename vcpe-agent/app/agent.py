@@ -1714,9 +1714,59 @@ class Agent:
     
                 logging.info("Skipping monitoring for class=%s because no steering policy exists", class_name) # no matching policy found
     
-            elif object_type == "tunnel":                                                   # tunnel object changed
-                payload = self.monitoring_manager.start_overlay_tunnel_monitoring(parent_dict) # call monitoring manager for overlay tunnel monitoring
-                logging.info("Started overlay tunnel monitoring payload=%s", payload)        # log successful tunnel monitoring request
+            elif object_type == "tunnel": 
+                tunnel_name = parent_dict.get("name")
+            
+                if not tunnel_name:
+                    logging.warning("Cannot start tunnel monitoring: tunnel has no name")
+                    return
+            
+                current_config = self.current_config_cache
+                policies = current_config.get("policy", {}).get("steering", [])
+            
+                for policy in self._as_list(policies):
+            
+                    uses_tunnel = (
+                        policy.get("failover-link-type") == "tunnel"
+                        or policy.get("load-balance-link-type") == "tunnel"
+                    )
+            
+                    if not uses_tunnel:
+                        continue
+            
+                    tunnel_names = []
+            
+                    if policy.get("primary-tunnel"):
+                        tunnel_names.append(policy.get("primary-tunnel"))
+            
+                    tunnel_names.extend(
+                        self._as_list(policy.get("secondary-tunnel"))
+                    )
+            
+                    tunnel_names.extend(
+                        self._as_list(policy.get("load-balance-tunnel"))
+                    )
+            
+                    if tunnel_name not in tunnel_names:
+                        continue
+            
+                    payload = self.monitoring_manager.start_overlay_tunnel_monitoring(
+                        tunnel=parent_dict,
+                        steering_policy=policy
+                    )
+            
+                    logging.info(
+                        "Started overlay monitoring for tunnel=%s payload=%s",
+                        tunnel_name,
+                        payload
+                    )
+            
+                    return
+            
+                logging.info(
+                    "Skipping tunnel monitoring for tunnel=%s because no steering policy uses it",
+                    tunnel_name
+                )
     
         except Exception as e:                                                            
             logging.exception(                                                          
