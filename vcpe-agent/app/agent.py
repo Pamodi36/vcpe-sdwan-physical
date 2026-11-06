@@ -1722,68 +1722,123 @@ class Agent:
             logging.exception(                                                          
                 "Failed to start monitoring for object_type=%s object=%s: %s",object_type, parent_dict, e)
             
-    def _stop_monitoring_for_object(self, object_type, parent_dict):                      # called after Clixon commit to stop monitoring
-        if not hasattr(self, "monitoring_manager"):                                       # check whether MonitoringManager is enabled
-            logging.warning("monitoring_manager not configured")                          # log warning if not enabled
-            return                                                                        # stop without failing agent
-
-        try:                                                                              # protect Clixon callback from monitoring errors
-            if object_type == "class":                                                              # traffic class deleted
-                class_name = parent_dict.get("name")                                                # read traffic class name
-            
-                if not class_name:                                                                  # class name is required
-                    logging.warning("Cannot stop monitoring: traffic class has no name")            # log missing class name
-                    return                                                                          # stop this monitoring action
-            
-                flow_id = self.flow_id_fwmarks.get(class_name)                                      # get fwmark/flow_id for this class
-            
-                if flow_id is None:                                                                 # if forwarder has not returned fwmark yet
-                    logging.warning("Cannot stop monitoring for class=%s because Forwarder fwmark is not available yet", class_name)
+    def _stop_monitoring_for_object(self, object_type, parent_dict, steering_policy=None, remove_fwmark=False):    # called after Clixon commit to stop monitoring
+            if not hasattr(self, "monitoring_manager"):
+            logging.warning("monitoring_manager not configured")
+            return
+    
+        try:
+            # ============================================================
+            # Traffic class monitoring
+            # ============================================================
+            if object_type == "class":
+    
+                class_name = parent_dict.get("name")
+    
+                if not class_name:
+                    logging.warning("Cannot stop monitoring: traffic class has no name")
                     return
-            
-                current_config = self.current_config_cache
-                policies = current_config.get("policy", {}).get("steering", [])                    # read steering policies
-            
-                for policy in self._as_list(policies):                                              # loop through steering policies
-                    if policy.get("class") != class_name:                                           # skip other traffic classes
-                        continue                                                                    # continue to next policy
-            
-                    wan_names = []                                                                  # collect WAN links for this traffic class
-            
-                    if policy.get("primary-wan-link"):                                              # failover primary WAN
-                        wan_names.append(policy.get("primary-wan-link"))                            # add primary WAN
-            
-                    wan_names.extend(self._as_list(policy.get("secondary-wan-link")))               # add secondary WANs
-                    wan_names.extend(self._as_list(policy.get("load-balance-wan-link")))            # add load-balance WANs
-            
-                    for wan_name in set(wan_names):                                                 # remove duplicates and loop
-                        if wan_name:                                                                # skip empty values
-                            self.monitoring_manager.stop_underlay_flow_monitoring(flow_id, wan_name) # stop monitor for flow_id + WAN link
-            
-                self.flow_id_fwmarks.pop(class_name, None)                                          # remove cached fwmark after class deletion
-            
-                logging.info(                                                                       # log successful stop handling
-                    "Stopped underlay monitoring for class=%s flow_id=%s",
-                    class_name,
-                    flow_id
+    
+                flow_id = self.flow_id_fwmarks.get(class_name)
+    
+                if flow_id is None:
+                    logging.warning(
+                        "Cannot stop monitoring for class=%s because "
+                        "Forwarder fwmark is not available yet",
+                        class_name,
+                    )
+                    return
+    
+                policy = steering_policy                                              # Use the explicitly supplied OLD steering policy. Do NOT read current_config_cache here.
+    
+                if not policy:
+                    logging.warning(
+                        "Cannot stop monitoring for class=%s because "
+                        "old steering policy is not available",
+                        class_name,
+                    )
+                    return
+    
+                wan_names = []
+    
+                # --------------------------------------------------------
+                # Collect WAN candidates from OLD steering policy
+                # --------------------------------------------------------
+    
+                if policy.get("primary-wan-link"):
+                    wan_names.append(
+                        policy.get("primary-wan-link")
+                    )
+    
+                wan_names.extend(
+                    self._as_list(
+                        policy.get("secondary-wan-link")
+                    )
                 )
-
-            elif object_type == "tunnel":                                                  # tunnel deleted
-                tunnel_id = parent_dict.get("name")                                       # YANG tunnel name is tunnel_id
-
-                if not tunnel_id:                                                         # tunnel name is required
-                    logging.warning("Cannot stop monitoring: tunnel has no name")          # log missing tunnel name
-                    return                                                                # stop this monitoring action
-
-                self.monitoring_manager.stop_overlay_tunnel_monitoring(tunnel_id)          # call monitoring manager to stop tunnel monitoring
-                logging.info("Stopped overlay monitoring for tunnel_id=%s", tunnel_id)     # log successful stop
-
-        except Exception as e:                                                             # catch any monitoring-related error
-            logging.exception(                                                             # log full exception without crashing callback server
-                "Failed to stop monitoring for object_type=%s object=%s: %s",
+    
+                wan_names.extend(
+                    self._as_list(
+                        policy.get("load-balance-wan-link")
+                    )
+                )
+    
+                # --------------------------------------------------------
+                # Stop old underlay monitoring jobs
+                # --------------------------------------------------------
+    
+                for wan_name in set(wan_names):
+                    if not wan_name:
+                        continue
+    
+                    self.monitoring_manager.stop_underlay_flow_monitoring(
+                        flow_id,
+                        wan_name,
+                    )
+    
+                if remove_fwmark:                                                # Remove fwmark only when the class itself is deleted. Do NOT remove it for a steering policy modification.
+                    self.flow_id_fwmarks.pop(
+                        class_name,
+                        None,
+                    )
+    
+                logging.info(
+                    "Stopped underlay monitoring for class=%s "
+                    "flow_id=%s remove_fwmark=%s",
+                    class_name,
+                    flow_id,
+                    remove_fwmark,
+                )
+    
+            # ============================================================
+            # Tunnel monitoring
+            # ============================================================
+            elif object_type == "tunnel":
+    
+                tunnel_id = parent_dict.get("name")
+    
+                if not tunnel_id:
+                    logging.warning(
+                        "Cannot stop monitoring: tunnel has no name"
+                    )
+                    return
+    
+                self.monitoring_manager.stop_overlay_tunnel_monitoring(
+                    tunnel_id
+                )
+    
+                logging.info(
+                    "Stopped overlay monitoring for tunnel_id=%s",
+                    tunnel_id,
+                )
+    
+        except Exception as e:
+    
+            logging.exception(
+                "Failed to stop monitoring for "
+                "object_type=%s object=%s: %s",
                 object_type,
                 parent_dict,
-                e
+                e,
             )
     # =====================================================================================
     # Rebuild runtime dataplane state from the persistent YANG datastore (Used after Clixon startup transaction-id 0.YANG datastore is the desired-state source of truth.)
@@ -2162,6 +2217,31 @@ class Agent:
                         "bind-wan-link"
                     ]
                 )
+
+            elif object_type == "steering":
+                class_name = new_parent_dict.get("class")
+            
+                if not class_name:
+                    class_name = old_parent_dict.get("class")
+            
+                if class_name:
+            
+                    # ---------------------------------------------------------
+                    # First stop jobs belonging to the OLD steering policy.
+                    # ---------------------------------------------------------
+                    if old_parent_dict:
+                        monitoring_stop_candidates.append({
+                            "object_type": "steering",
+                            "class_name": class_name,
+                            "steering_policy": old_parent_dict,  })
+            
+                    # ---------------------------------------------------------
+                    # After commit, start/update jobs using CURRENT config.
+                    # ---------------------------------------------------------
+                    monitoring_start_candidates.append({
+                        "object_type": "class",
+                        "class_name": class_name,
+                    })
             
                 if peer_relationship_changed:
                     controller_reconcile_needed = True
@@ -2435,11 +2515,26 @@ class Agent:
                     object_type = self._local_name(deleted_xml.tag)                                   # determine deleted object type
                     parent_dict = self._xml_to_dict(deleted_xml)                                      # convert deleted object into Python dict
         
-                    if object_type in ["class", "tunnel"]:
+                    if object_type == "class":
+                        class_name = parent_dict.get("name")                                  # deleted traffic class name
+                        old_steering_policy = None                                            # default if no policy exists
+                    
+                        policies = self.current_config_cache.get(
+                            "policy", {}
+                        ).get(
+                            "steering", []
+                        )
+                    
+                        for policy in self._as_list(policies):                                # search policy belonging to deleted class
+                            if policy.get("class") == class_name:
+                                old_steering_policy = policy
+                                break
+                    
                         monitoring_stop_candidates.append({
-                            "object_type": object_type,
-                            "parent_dict": parent_dict
-                        })                                                                            # stop monitoring after successful commit
+                            "object_type": "class",
+                            "parent_dict": parent_dict,                                       # OLD traffic-class data
+                            "steering_policy": old_steering_policy                            # preserve OLD steering policy
+                        })
 
                     if object_type == "tunnel":                                                      
                         tunnel_id = parent_dict.get("name")
@@ -2462,16 +2557,63 @@ class Agent:
                 threading.Thread(target=self._wait_for_wan_ready, args=(wan,), daemon=True).start()                                                                       # wait for DHCP without blocking Clixon commit
 
             for item in monitoring_start_candidates:                                        # start/update monitoring only after real commit
-                self._start_monitoring_for_object(                              
-                    item["object_type"],                                                    # class or tunnel
-                    item["parent_dict"]                                                     # object data
-                )
+                if item["object_type"] == "class":                                           # traffic class added/changed or steering changed
+            
+                    class_name = item.get("class_name")                                      # get class name
+            
+                    if class_name:
+                        current_class = None                                                 # default if class not found
+            
+                        traffic_classes = self.current_config_cache.get(
+                            "traffic", {}
+                        ).get(
+                            "class", []
+                        )
+            
+                        for traffic_class in self._as_list(traffic_classes):                 # search current committed config
+                            if traffic_class.get("name") == class_name:
+                                current_class = traffic_class
+                                break
+            
+                        if current_class:
+                            self._start_monitoring_for_object(
+                                "class",
+                                current_class
+                            )
+                        else:
+                            logging.warning(
+                                "Cannot start monitoring: class=%s not found in current config cache",
+                                class_name
+                            )
+            
+                elif item["object_type"] == "tunnel":                                        # tunnel added/changed
+                    self._start_monitoring_for_object(
+                        "tunnel",
+                        item["parent_dict"]
+                    )
 
             for item in monitoring_stop_candidates:                                        # stop monitoring only after real commit
-                self._stop_monitoring_for_object(                                      
-                    item["object_type"],                                                    # class or tunnel
-                    item["parent_dict"]                                                     # object data
-                )
+                if item["object_type"] == "class":                                          # traffic class deleted
+                    self._stop_monitoring_for_object(
+                        "class",
+                        item["parent_dict"],
+                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
+                        remove_fwmark=True                                                  # class is really deleted
+                    )
+            
+                elif item["object_type"] == "steering":                                     # steering policy changed
+                    self._stop_monitoring_for_object(
+                        "class",
+                        {"name": item["class_name"]},                                       # class still exists
+                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
+                        remove_fwmark=False                                                 # keep fwmark mapping
+                    )
+            
+                elif item["object_type"] == "tunnel":                                       # tunnel deleted
+                    self._stop_monitoring_for_object(
+                        "tunnel",
+                        item["parent_dict"]
+                    )
 
             for tunnel_id in deleted_tunnel_candidates:
                 self._delete_wireguard_tunnel_keys(tunnel_id)                                # delete private/public key files and runtime key cache after committed tunnel deletion
