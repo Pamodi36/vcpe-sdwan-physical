@@ -73,6 +73,8 @@ class MonitoringManager:
         logging.info("Creating/updating underlay monitoring job: %s", payload)
     
         response = requests.post(url, json=payload, timeout=5)
+
+        logging.info("Underlay monitoring response: status=%s body=%s", response.status_code, response.text)
     
         response.raise_for_status()
     
@@ -121,6 +123,7 @@ class MonitoringManager:
         logging.info("Sending tunnel monitoring request: %s", payload)                   
 
         response = requests.post(url, json=payload, timeout=5)                           # send POST request to vcpe-monitoring
+        logging.info("Overlay monitoring response: status=%s body=%s", response.status_code, response.text)
         response.raise_for_status()                                                      
 
         return payload                                                                  
