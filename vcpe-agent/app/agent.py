@@ -1651,7 +1651,7 @@ class Agent:
     # =====================================================================================
     # Monitoring manager helper
     # =====================================================================================
-    def _start_monitoring_for_object(self, object_type, parent_dict):                      # called after Clixon commit to start/update monitoring
+    def _start_monitoring_for_object(self, object_type, parent_dict, steering_policy=None):                      # called after Clixon commit to start/update monitoring
         if not hasattr(self, "monitoring_manager"):                                        # check whether MonitoringManager is enabled
             logging.warning("monitoring_manager not configured")                           # log missing monitoring manager
             return                                                                         # stop without failing agent
@@ -1665,7 +1665,7 @@ class Agent:
                     return                                                                 # stop this monitoring action
     
                 current_config = self.current_config_cache          
-                policies = current_config.get("policy", {}).get("steering", [])           # read steering policies
+                policies = ([steering_policy] if steering_policy else current_config.get("policy", {}).get("steering", [])   # read steering policies
     
                 for policy in self._as_list(policies):                                     # loop through steering policies
                     if policy.get("class") != class_name:                                  # skip policies for other traffic classes
@@ -2685,7 +2685,8 @@ class Agent:
                         if current_class:
                             self._start_monitoring_for_object(
                                 "class",
-                                current_class
+                                current_class,
+                                steering_policy=item.get("steering_policy")
                             )
                         else:
                             logging.warning(
