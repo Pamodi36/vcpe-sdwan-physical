@@ -27,14 +27,12 @@ class MonitoringManager:
     
         dst_prefix = five_tuple.get("dst-prefix")
         destination_ip = self._ip_from_prefix(dst_prefix)
-    
         if not destination_ip:
             raise ValueError("Cannot start underlay monitoring without destination")
     
         # ---------------------------------------------------------
-        # Five-tuple used by passive monitoring to isolate this TC
+        # Five tuple used by passive monitoring to isolate a Traffic class
         # ---------------------------------------------------------
-    
         flow_filter = {
             "src_prefix": five_tuple.get("src-prefix"),
             "dst_prefix": five_tuple.get("dst-prefix"),
@@ -51,19 +49,16 @@ class MonitoringManager:
         # ---------------------------------------------------------
         # SLO required by monitoring adaptive rule engine
         # ---------------------------------------------------------
-    
         slo = {
             "max_latency_ms": steering_policy.get("max-latency-ms"),
             "max_jitter_ms": steering_policy.get("max-jitter-ms"),
             "max_loss_percent": steering_policy.get("max-loss-percent"),
-            "min_bandwidth_kbps": steering_policy.get("min-bandwidth-kbps")
-        }
+            "min_bandwidth_kbps": steering_policy.get("min-bandwidth-kbps") }
     
         slo = {
             key: value
             for key, value in slo.items()
-            if value is not None
-        }
+            if value is not None }
     
         payload = {
             "flow_id": str(flow_id),
@@ -77,11 +72,7 @@ class MonitoringManager:
     
         logging.info("Creating/updating underlay monitoring job: %s", payload)
     
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=5
-        )
+        response = requests.post(url, json=payload, timeout=5)
     
         response.raise_for_status()
     
@@ -98,11 +89,10 @@ class MonitoringManager:
     def start_overlay_tunnel_monitoring(self, tunnel):                                   
         tunnel_id = tunnel.get("name")           
             if not tunnel_id:
-        raise ValueError(
-            "Cannot start tunnel monitoring without tunnel name"
-        )
+        raise ValueError("Cannot start tunnel monitoring without tunnel name")
+        
         resolved_peer = tunnel.get("resolved-peer", {})                                
-        destination_ip = resolved_peer.get("peer-address")                                # use peer-address as tunnel monitoring destination
+        destination_ip = resolved_peer.get("peer-local-address")                                # use peer local WG tunnel address as tunnel monitoring destination
 
         if not tunnel_id:                                                              
             raise ValueError("Cannot start tunnel monitoring without tunnel name")       
@@ -112,9 +102,7 @@ class MonitoringManager:
 
         payload = {                                                                      # payload sent to vcpe-monitoring
             "tunnel_id": str(tunnel_id),                                                 # overlay tunnel ID; not a flow_id
-            "destination_ip": destination_ip,                                            # tunnel peer/endpoint IP used as probe target
-            "probe_tools": ["ping","iperf3","twamp"],                                                      
-            "interval_sec": 600                                                          # fixed interval for tunnel monitoring
+            "destination_ip": destination_ip,                                            
         }
 
         url = f"{self.monitoring_base_url}/monitoring/tunnels"                           # vcpe-monitoring endpoint for tunnel monitoring  
