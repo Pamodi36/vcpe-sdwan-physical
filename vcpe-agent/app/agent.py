@@ -2700,8 +2700,7 @@ class Agent:
                 elif item["object_type"] == "tunnel":                                       # tunnel deleted
                     self._stop_monitoring_for_object(
                         "tunnel",
-                        item["parent_dict"],
-                        steering_policy=item.get("steering_policy")
+                        item["parent_dict"]
                     )
 
             for item in monitoring_start_candidates:                                        # start/update monitoring only after real commit
