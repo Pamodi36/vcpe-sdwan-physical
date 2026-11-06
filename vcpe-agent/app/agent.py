@@ -2258,6 +2258,10 @@ class Agent:
                         "changed_leafs": []}
                 else:
                     changed_objects[object_key]["parent_dict"] = parent_dict
+                    changed_objects[object_key]["new_parent_dict"] = new_parent_dict
+
+                    if old_parent_dict:
+                        changed_objects[object_key]["old_parent_dict"] = old_parent_dict
                     
                 if changed_leaf not in changed_objects[object_key]["changed_leafs"]:
                     changed_objects[object_key]["changed_leafs"].append(changed_leaf)
@@ -2284,6 +2288,14 @@ class Agent:
                 })
             
             elif object_type == "tunnel":
+                peer_relationship_changed = any(
+                    leaf in changed_leafs
+                    for leaf in [
+                        "remote-cpe-id",
+                        "remote-tunnel-name",
+                        "bind-wan-link"
+                    ]
+                )
                 if peer_relationship_changed:
                     controller_reconcile_needed = True
             
@@ -2297,15 +2309,6 @@ class Agent:
                         "object_type": "tunnel",
                         "parent_dict": parent_dict
                     })     
-            
-                peer_relationship_changed = any(
-                    leaf in changed_leafs
-                    for leaf in [
-                        "remote-cpe-id",
-                        "remote-tunnel-name",
-                        "bind-wan-link"
-                    ]
-                )
 
             elif object_type == "steering":
                 class_name = new_parent_dict.get("class")
@@ -2330,6 +2333,7 @@ class Agent:
                     monitoring_start_candidates.append({
                         "object_type": "class",
                         "class_name": class_name,
+                        "steering_policy": new_parent_dict
                     })                                    
             
         added = root.find("added")                                                      # contains newly added datastore objects
@@ -2617,6 +2621,10 @@ class Agent:
 
                         if tunnel_id and tunnel_id not in deleted_tunnel_candidates:
                             deleted_tunnel_candidates.append(tunnel_id)                               # Schedule key cleanup for complete tunnel deletion 
+                            
+                            monitoring_stop_candidates.append({
+                                "object_type": "tunnel",
+                                "parent_dict": parent_dict})
                 
         forwarder_result = None
 
