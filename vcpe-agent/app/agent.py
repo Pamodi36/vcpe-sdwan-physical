@@ -2328,13 +2328,47 @@ class Agent:
                             "steering_policy": old_parent_dict,  })
             
                     # ---------------------------------------------------------
-                    # After commit, start/update jobs using CURRENT config.
+                    # After commit, start/update jobs using NEW policy.
                     # ---------------------------------------------------------
-                    monitoring_start_candidates.append({
-                        "object_type": "class",
-                        "class_name": class_name,
-                        "steering_policy": new_parent_dict
-                    })                                    
+                    uses_tunnel = (
+                        new_parent_dict.get("failover-link-type") == "tunnel"
+                        or new_parent_dict.get("load-balance-link-type") == "tunnel"
+                    )
+                    
+                    if uses_tunnel:
+                        tunnel_names = []
+                    
+                        tunnel_names.extend(
+                            self._as_list(new_parent_dict.get("primary-tunnel"))
+                        )
+                        tunnel_names.extend(
+                            self._as_list(new_parent_dict.get("secondary-tunnel"))
+                        )
+                        tunnel_names.extend(
+                            self._as_list(new_parent_dict.get("load-balance-tunnel"))
+                        )
+                    
+                        for tunnel_name in set(tunnel_names):
+                            if not tunnel_name:
+                                continue
+                    
+                            for tunnel in self._as_list(
+                                self.current_config_cache.get("overlay", {}).get("tunnel", [])
+                            ):
+                                if tunnel.get("name") == tunnel_name:
+                                    monitoring_start_candidates.append({
+                                        "object_type": "tunnel",
+                                        "parent_dict": tunnel,
+                                        "steering_policy": new_parent_dict
+                                    })
+                                    break
+                    
+                    else:
+                        monitoring_start_candidates.append({
+                            "object_type": "class",
+                            "class_name": class_name,
+                            "steering_policy": new_parent_dict
+                        })                                   
             
         added = root.find("added")                                                      # contains newly added datastore objects
         
