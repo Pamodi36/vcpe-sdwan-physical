@@ -68,7 +68,7 @@ class MonitoringManager:
             "slo": slo,
         }
     
-        url = (f"{self.monitoring_base_url}" f"/api/v1/monitoring/flows")
+        url = f"{self.monitoring_base_url}/monitoring/flows"
     
         logging.info("Creating/updating underlay monitoring job: %s", payload)
     
@@ -86,10 +86,10 @@ class MonitoringManager:
         response = requests.delete(url, timeout=5)                                        # send DELETE request to vcpe-monitoring
         response.raise_for_status()                                                   
 
-    def start_overlay_tunnel_monitoring(self, tunnel):                                   
+    def start_overlay_tunnel_monitoring(self, tunnel, steering_policy):                                   
         tunnel_id = tunnel.get("name")           
-            if not tunnel_id:
-        raise ValueError("Cannot start tunnel monitoring without tunnel name")
+        if not tunnel_id:
+            raise ValueError("Cannot start tunnel monitoring without tunnel name")
         
         resolved_peer = tunnel.get("resolved-peer", {})                                
         destination_ip = resolved_peer.get("peer-local-address")                                # use peer local WG tunnel address as tunnel monitoring destination
@@ -98,11 +98,25 @@ class MonitoringManager:
             raise ValueError("Cannot start tunnel monitoring without tunnel name")       
 
         if not destination_ip:                                                           
-            raise ValueError("Cannot start tunnel monitoring without peer-address")       
+            raise ValueError("Cannot start tunnel monitoring without peer-address")  
+
+        slo = {
+            "max_latency_ms": steering_policy.get("max-latency-ms"),
+            "max_jitter_ms": steering_policy.get("max-jitter-ms"),
+            "max_loss_percent": steering_policy.get("max-loss-percent"),
+            "min_bandwidth_kbps": steering_policy.get("min-bandwidth-kbps")
+        }
+        
+        slo = {
+            key: value
+            for key, value in slo.items()
+            if value is not None
+        }
 
         payload = {                                                                      # payload sent to vcpe-monitoring
             "tunnel_id": str(tunnel_id),                                                 # overlay tunnel ID; not a flow_id
-            "destination_ip": destination_ip,                                            
+            "destination_ip": destination_ip,            
+            "slo": slo,
         }
 
         url = f"{self.monitoring_base_url}/monitoring/tunnels"                           # vcpe-monitoring endpoint for tunnel monitoring  
