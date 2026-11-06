@@ -1107,7 +1107,7 @@ class Agent:
             if response.status_code == 404:                                                # forwarder does not support bulk GET yet
                 logging.warning(
                     "Forwarder does not support GET /api/v1/flow-policies yet; "
-                    "temporary fake fwmarks will be assigned when needed"
+                    "fwmarks cannot be recovered until the Forwarder provides them"
                 )
                 return                                                                    # continue agent startup without recovered fwmarks
     
@@ -1147,7 +1147,7 @@ class Agent:
                         "Forwarder flow-policy=%s has no fwmark",
                         policy_id
                     )
-                    continue                                                              # temporary fake fwmark logic will handle this later
+                    continue                                                              # monitoring cannot start until a valid Forwarder fwmark is available
     
                 self._store_forwarder_fwmark(traffic_class, fwmark)                       # store recovered fwmark in runtime cache
     
@@ -2740,7 +2740,8 @@ class Agent:
                 elif item["object_type"] == "tunnel":                                        # tunnel added/changed
                     self._start_monitoring_for_object(
                         "tunnel",
-                        item["parent_dict"]
+                        item["parent_dict"],
+                        steering_policy=item.get("steering_policy")
                     )
 
 
