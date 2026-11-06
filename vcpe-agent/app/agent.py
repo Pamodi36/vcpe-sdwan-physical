@@ -1066,9 +1066,15 @@ class Agent:
             traffic_class = path.rsplit("traffic-class-", 1)[-1]                          # extract traffic class name from flow policy path
     
             if fwmark is not None:
-                self._store_forwarder_fwmark(traffic_class, fwmark)                       # normal final behavior
+                self._store_forwarder_fwmark(
+                    traffic_class,
+                    fwmark
+                )
             else:
-                self._assign_temporary_fake_fwmark(traffic_class)                         # temporary behavior until forwarder returns fwmark
+                logging.warning(
+                    "Forwarder returned no fwmark for traffic_class=%s",
+                    traffic_class
+                )
 
     def _sync_fwmarks_from_forwarder(self):
         if self.forwarder_dry_run:                                                        # skip forwarder recovery when forwarder API calls are disabled
@@ -1722,7 +1728,7 @@ class Agent:
                     return
             
                 current_config = self.current_config_cache
-                policies = current_config.get("policy", {}).get("steering", [])
+                policies = ([steering_policy] if steering_policy else current_config.get("policy", {}).get("steering", []))
             
                 for policy in self._as_list(policies):
             
@@ -2551,53 +2557,53 @@ class Agent:
                             other_tunnel_deleted_nodes.append(node)
                 
                 
-                    # -------------------------------------------------------------
-                    # Partial deletion of WireGuard allowed-prefix
-                    # -------------------------------------------------------------
-                    if deleted_allowed_prefixes:
+                # -------------------------------------------------------------
+                # Partial deletion of WireGuard allowed-prefix
+                # -------------------------------------------------------------
+                if deleted_allowed_prefixes:
                 
-                        resolved_peer = parent_dict.get("resolved-peer") or {}
+                    resolved_peer = parent_dict.get("resolved-peer") or {}
                 
-                        old_prefixes = self._as_list(
-                            resolved_peer.get("allowed-prefix")
-                        )
+                    old_prefixes = self._as_list(
+                        resolved_peer.get("allowed-prefix")
+                    )
                 
-                        remaining_prefixes = [
-                            prefix
-                            for prefix in old_prefixes
-                            if prefix not in deleted_allowed_prefixes
-                        ]
+                    remaining_prefixes = [
+                        prefix
+                        for prefix in old_prefixes
+                        if prefix not in deleted_allowed_prefixes
+                    ]
                 
-                        resolved_peer["allowed-prefix"] = remaining_prefixes
-                        parent_dict["resolved-peer"] = resolved_peer
+                    resolved_peer["allowed-prefix"] = remaining_prefixes
+                    parent_dict["resolved-peer"] = resolved_peer
 
-                        operations.append(self._operation("DELETE",
-                                f"/api/v1/routes/static/{tunnel_id}-peer-routes"                        # Delete old route-set first so stale kernel routes are removed
-                            )
+                    operations.append(self._operation("DELETE",
+                            f"/api/v1/routes/static/{tunnel_id}-peer-routes"                        # Delete old route-set first so stale kernel routes are removed
                         )
+                    )
                 
-                        operations.extend(
-                            self._build_tunnel_operations(
-                                parent_dict,
-                                ["allowed-prefix"],
-                                delete=False
-                            )
+                    operations.extend(
+                        self._build_tunnel_operations(
+                            parent_dict,
+                            ["allowed-prefix"],
+                            delete=False
                         )
+                    )
                 
                 
-                    # Preserve existing behaviour for other partial tunnel deletions
-                    for node in other_tunnel_deleted_nodes:
+                # Preserve existing behaviour for other partial tunnel deletions
+                for node in other_tunnel_deleted_nodes:
                 
-                        data = node.find("data")
-                        deleted_xml = self._first_child(data)
+                    data = node.find("data")
+                    deleted_xml = self._first_child(data)
                 
-                        operations.extend(
-                            self._build_operations_from_parent_xml(
-                                deleted_xml,
-                                ["*"],
-                                delete=True
-                            )
-                        )                                                                          
+                    operations.extend(
+                        self._build_operations_from_parent_xml(
+                            deleted_xml,
+                            ["*"],
+                            delete=True
+                        )
+                    )                                                                          
                         
         
             for node in other_deleted_nodes:
@@ -2694,7 +2700,8 @@ class Agent:
                 elif item["object_type"] == "tunnel":                                       # tunnel deleted
                     self._stop_monitoring_for_object(
                         "tunnel",
-                        item["parent_dict"]
+                        item["parent_dict"],
+                        steering_policy=item.get("steering_policy")
                     )
 
             for item in monitoring_start_candidates:                                        # start/update monitoring only after real commit
@@ -2704,17 +2711,19 @@ class Agent:
             
                     if class_name:
                         current_class = item.get("parent_dict")
-            
-                        traffic_classes = self.current_config_cache.get(
-                            "traffic", {}
-                        ).get(
-                            "class", []
-                        )
-            
-                        for traffic_class in self._as_list(traffic_classes):                 # search current committed config
-                            if traffic_class.get("name") == class_name:
-                                current_class = traffic_class
-                                break
+                    
+                        if current_class is None:
+                    
+                            traffic_classes = self.current_config_cache.get(
+                                "traffic", {}
+                            ).get(
+                                "class", []
+                            )
+                    
+                            for traffic_class in self._as_list(traffic_classes):
+                                if traffic_class.get("name") == class_name:
+                                    current_class = traffic_class
+                                    break
             
                         if current_class:
                             self._start_monitoring_for_object(
