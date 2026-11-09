@@ -33,12 +33,16 @@ class MonitoringManager:
         # ---------------------------------------------------------
         # Five tuple used by passive monitoring to isolate a Traffic class
         # ---------------------------------------------------------
+        src_port = five_tuple.get("src-port")
+        dst_port = five_tuple.get("dst-port")
+        l4_protocol = five_tuple.get("l4-protocol")
+
         flow_filter = {
             "src_prefix": five_tuple.get("src-prefix"),
             "dst_prefix": five_tuple.get("dst-prefix"),
-            "l4_protocol": five_tuple.get("l4-protocol"),
-            "src_port": five_tuple.get("src-port"),
-            "dst_port": five_tuple.get("dst-port")
+            "l4_protocol": None if l4_protocol == "any" else l4_protocol,
+            "src_port": None if src_port == "any" else src_port,
+            "dst_port": None if dst_port == "any" else dst_port,
         }
     
         flow_filter = {
@@ -99,23 +103,9 @@ class MonitoringManager:
         if not destination_ip:                                                           
             raise ValueError("Cannot start tunnel monitoring without peer-address")  
 
-        slo = {
-            "max_latency_ms": steering_policy.get("max-latency-ms"),
-            "max_jitter_ms": steering_policy.get("max-jitter-ms"),
-            "max_loss_percent": steering_policy.get("max-loss-percent"),
-            "min_bandwidth_kbps": steering_policy.get("min-bandwidth-kbps")
-        }
-        
-        slo = {
-            key: value
-            for key, value in slo.items()
-            if value is not None
-        }
-
         payload = {                                                                      # payload sent to vcpe-monitoring
             "tunnel_id": str(tunnel_id),                                                 # overlay tunnel ID; not a flow_id
             "destination_ip": destination_ip,            
-            "slo": slo,
         }
 
         url = f"{self.monitoring_base_url}/monitoring/tunnels"                           # vcpe-monitoring endpoint for tunnel monitoring  
