@@ -98,7 +98,7 @@ class MetricReader:
                 "available_bandwidth_kbps": 60000
             },
         
-            ("260", "UPL2"): {
+            ("259", "UPL2"): {
                 "latency_ms": 30,
                 "jitter_ms": 5,
                 "loss_percent": 0.3,
