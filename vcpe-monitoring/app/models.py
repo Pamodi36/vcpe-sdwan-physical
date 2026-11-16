@@ -13,9 +13,17 @@ ProbeTool = Literal["passive", "stamp", "iperf3"]
 class FlowFilter(BaseModel):
     src_prefix: str | None = None
     dst_prefix: str | None = None
-    protocol: Literal["tcp", "udp", "any"] = "tcp"
+    # YANG supports TCP, UDP, ICMP and any. Missing => no protocol restriction.
+    protocol: Literal["tcp", "udp", "icmp", "any"] = "any"
     src_port: int | None = Field(default=None, ge=0, le=65535)
     dst_port: int | None = Field(default=None, ge=0, le=65535)
+
+    @field_validator("src_port", "dst_port", mode="before")
+    @classmethod
+    def allow_any_port(cls, value):
+        if isinstance(value, str) and value.strip().lower() == "any":
+            return None
+        return value
 
     @field_validator("src_prefix", "dst_prefix")
     @classmethod

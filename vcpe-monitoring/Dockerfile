@@ -17,4 +17,4 @@ COPY app ./app
 
 EXPOSE 9100/tcp 862/udp 5201/tcp
 
-CMD ["sh", "-c", "uvicorn app.main:app --host ${API_BIND:-0.0.0.0} --port ${API_PORT:-9100}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host ${API_BIND:-0.0.0.0} --port ${API_PORT:-9100} --loop asyncio"]

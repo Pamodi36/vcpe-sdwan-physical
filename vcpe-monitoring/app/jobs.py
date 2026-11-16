@@ -60,6 +60,7 @@ class JobManager:
         self.rule_engine = RuleEngine()
         self._jobs: dict[str, JobHandle] = {}
         self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
 
     @staticmethod
     def flow_key(flow_id: str, wan_link: str) -> str:
@@ -72,52 +73,95 @@ class JobManager:
     async def start_flow(self, request: FlowMonitoringRequest) -> tuple[JobHandle, bool]:
         interface = self.resolver.resolve_wan(request.wan_link)
         key = self.flow_key(request.flow_id, request.wan_link)
-        updated = await self._stop_key(key, missing_ok=True)
-        self.passive.ensure(interface)
-        task = asyncio.create_task(self._flow_worker(key, request, interface), name=f"monitor-{key}")
-        handle = JobHandle("flow", key, interface, request, task)
-        async with self._lock:
-            self._jobs[key] = handle
-        return handle, updated
+        async with self._lifecycle_lock:
+            async with self._lock:
+                previous = self._jobs.get(key)
+            if previous is not None and not previous.task.done() and previous.request == request and previous.interface == interface:
+                # Agent startup reconciliation may re-POST identical desired state.
+                return previous, False
+            updated = await self._stop_key(key, missing_ok=True)
+            if "passive" in request.probe_tools and request.flow_filter is not None and request.flow_filter.protocol in {"tcp", "any"}:
+                self.passive.ensure(interface)
+            task = asyncio.create_task(self._guard_worker(key, request, interface, is_flow=True), name=f"monitor-{key}")
+            handle = JobHandle("flow", key, interface, request, task)
+            async with self._lock:
+                self._jobs[key] = handle
+            return handle, updated
 
     async def start_tunnel(self, request: TunnelMonitoringRequest) -> tuple[JobHandle, bool]:
         interface = self.resolver.resolve_tunnel(request.tunnel_id)
         key = self.tunnel_key(request.tunnel_id)
-        updated = await self._stop_key(key, missing_ok=True)
-        self.passive.ensure(interface)
-        task = asyncio.create_task(self._tunnel_worker(key, request, interface), name=f"monitor-{key}")
-        handle = JobHandle("tunnel", key, interface, request, task)
-        async with self._lock:
-            self._jobs[key] = handle
-        return handle, updated
+        async with self._lifecycle_lock:
+            async with self._lock:
+                previous = self._jobs.get(key)
+            if previous is not None and not previous.task.done() and previous.request == request and previous.interface == interface:
+                return previous, False
+            updated = await self._stop_key(key, missing_ok=True)
+            if "passive" in request.probe_tools:
+                self.passive.ensure(interface)
+            task = asyncio.create_task(self._guard_worker(key, request, interface, is_flow=False), name=f"monitor-{key}")
+            handle = JobHandle("tunnel", key, interface, request, task)
+            async with self._lock:
+                self._jobs[key] = handle
+            return handle, updated
+
+    async def _guard_worker(self, key, request, interface, *, is_flow: bool) -> None:
+        try:
+            if is_flow:
+                await self._flow_worker(key, request, interface)
+            else:
+                await self._tunnel_worker(key, request, interface)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.exception("Monitoring job %s failed during execution", key)
+            async with self._lock:
+                handle = self._jobs.get(key)
+                if handle is not None and handle.task is asyncio.current_task():
+                    handle.state = "failed"
+                    handle.last_error = f"execution: {type(exc).__name__}: {exc}"
+            # Preserve diagnostics until a subsequent POST restarts this task.
 
     async def stop_flow(self, flow_id: str, wan_link: str) -> bool:
-        return await self._stop_key(self.flow_key(flow_id, wan_link), missing_ok=False)
+        async with self._lifecycle_lock:
+            return await self._stop_key(self.flow_key(flow_id, wan_link), missing_ok=False)
 
     async def stop_tunnel(self, tunnel_id: str) -> bool:
-        return await self._stop_key(self.tunnel_key(tunnel_id), missing_ok=False)
+        async with self._lifecycle_lock:
+            return await self._stop_key(self.tunnel_key(tunnel_id), missing_ok=False)
 
     async def _stop_key(self, key: str, *, missing_ok: bool) -> bool:
+        """Called while lifecycle lock is held; must not reacquire that lock."""
         async with self._lock:
             handle = self._jobs.pop(key, None)
         if handle is None:
             if missing_ok:
                 return False
             raise KeyError(key)
+        # A task that already failed should not be described as a cancellation failure.
+        if handle.task.done():
+            try:
+                handle.task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                LOG.exception("Monitoring job %s had previously failed", key)
+            return True
         handle.task.cancel()
         try:
             await handle.task
         except asyncio.CancelledError:
             pass
         except Exception:
-            LOG.exception("Monitoring job %s failed during cancellation", key)
+            LOG.exception("Monitoring job %s failed while stopping", key)
         return True
 
     async def stop_all(self) -> None:
-        async with self._lock:
-            keys = list(self._jobs)
-        for key in keys:
-            await self._stop_key(key, missing_ok=True)
+        async with self._lifecycle_lock:
+            async with self._lock:
+                keys = list(self._jobs)
+            for key in keys:
+                await self._stop_key(key, missing_ok=True)
 
     async def list_jobs(self) -> list[JobView]:
         async with self._lock:
@@ -181,12 +225,15 @@ class JobManager:
             last_bandwidth = handle.last_bandwidth_mono
 
         flow_filter = request.flow_filter if isinstance(request, FlowMonitoringRequest) else None
-        passive = await asyncio.to_thread(
-            self.passive.snapshot,
-            interface,
-            request.adaptive.passive_window_sec,
-            flow_filter,
-        )
+        # ICMP/UDP have no TCP passive measurements; do not interpret other TCP
+        # packets as evidence for those classes.
+        if "passive" in request.probe_tools and (flow_filter is None or flow_filter.protocol in {"tcp", "any"}):
+            passive = await asyncio.to_thread(
+                self.passive.snapshot, interface,
+                request.adaptive.passive_window_sec, flow_filter,
+            )
+        else:
+            passive = PassiveSnapshot()
 
         now_mono = time.monotonic()
         decision = self.rule_engine.decide(
@@ -281,7 +328,9 @@ class JobManager:
     ) -> None:
         if sample.has_any_metric():
             try:
-                await asyncio.to_thread(write)
+                persisted = await asyncio.to_thread(write)
+                if not persisted:
+                    errors.append("influx: writer disabled or no sample persisted")
             except Exception as exc:
                 LOG.exception("InfluxDB write failed for %s", key)
                 errors.append(f"influx: {exc}")
