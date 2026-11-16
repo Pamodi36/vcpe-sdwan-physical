@@ -40,7 +40,7 @@ class MonitoringManager:
         flow_filter = {
             "src_prefix": five_tuple.get("src-prefix"),
             "dst_prefix": five_tuple.get("dst-prefix"),
-            "l4_protocol": None if l4_protocol == "any" else l4_protocol,
+            "protocol": str(l4_protocol or "any").lower(),
             "src_port": None if src_port == "any" else src_port,
             "dst_port": None if dst_port == "any" else dst_port,
         }
