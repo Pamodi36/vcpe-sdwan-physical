@@ -75,14 +75,14 @@ class MetricReader:
             # Flow 260 -> test-underlay-fo
             # ---------------------------------------------------------
             ("260", "UPL1"): {
-                "latency_ms": 80,
+                "latency_ms": 30,
                 "jitter_ms": 3,
                 "loss_percent": 0.1,
                 "available_bandwidth_kbps": 50000
             },
         
             ("260", "UPL2"): {
-                "latency_ms": 85,
+                "latency_ms": 28,
                 "jitter_ms": 8,
                 "loss_percent": 0.5,
                 "available_bandwidth_kbps": 30000
