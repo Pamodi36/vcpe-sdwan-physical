@@ -866,7 +866,7 @@ class Agent:
                         f"<loss-percent>{loss}</loss-percent>"
                     )
 
-                bandwidth = metric_state.get("available-bandwidth-kbps")
+                bandwidth = metric_state.get("bandwidth-kbps")
                 if bandwidth is not None:
                     xml_parts.append(
                         f"<available-bandwidth-kbps>{int(bandwidth)}</available-bandwidth-kbps>"
@@ -1716,29 +1716,11 @@ class Agent:
                             wan_name,
                             payload
                         )
-    
-                    seen_wan_names = set()                                                 # avoid duplicate monitoring requests
-    
-                    for wan_name in wan_names:                                             # start one monitor per WAN candidate
-                        if not wan_name or wan_name in seen_wan_names:                     # skip empty or duplicate names
-                            continue                                                       # continue to next WAN
-    
-                        seen_wan_names.add(wan_name)                                       # remember this WAN was already processed
-    
-                        payload = self.monitoring_manager.start_underlay_flow_monitoring(   # call monitoring manager for this flow over this WAN
-                            traffic_class=parent_dict,                                     # traffic class contains five-tuple
-                            steering_policy=policy,                                        # steering policy contains SLO values
-                            flow_id=flow_id,                                                # flow_id is fwmark in final logic
-                            wan_link_name=wan_name                                          # candidate WAN link used for this probe
-                        )
-    
-                        logging.info(                                                      
-                            "Started underlay monitoring for class=%s wan_link=%s payload=%s",class_name, wan_name, payload)
                     return                                                                
     
                 logging.info("Skipping monitoring for class=%s because no steering policy exists", class_name) # no matching policy found
     
-            elif object_type == "tunnel": 
+            elif object_type == "tunnel":
                 tunnel_name = parent_dict.get("name")
             
                 if not tunnel_name:
@@ -1746,35 +1728,23 @@ class Agent:
                     return
             
                 current_config = self.current_config_cache
-                policies = ([steering_policy] if steering_policy else current_config.get("policy", {}).get("steering", []))
+            
+                policies = (
+                    [steering_policy]
+                    if steering_policy
+                    else current_config.get("policy", {}).get("steering", [])
+                )
             
                 for policy in self._as_list(policies):
             
-                    uses_tunnel = (policy.get("link-type") == "tunnel")
-            
-                    if not uses_tunnel:
+                    if policy.get("link-type") != "tunnel":
                         continue
             
-                    tunnel_names = []
-            
-                    for policy in self._as_list(policies):
-                        if policy.get("link-type") != "tunnel":
-                            continue
-                    
-                        if not parent_dict.get("admin-enabled", True):
-                            return
-                    
-                        if not parent_dict.get("resolved-peer"):
-                            return
-                    
-                        payload = self.monitoring_manager.start_overlay_tunnel_monitoring(tunnel=parent_dict, steering_policy=policy)
-                    
-                        logging.info("Started overlay monitoring for tunnel=%s payload=%s", tunnel_name, payload)
-                    
+                    if not parent_dict.get("admin-enabled", True):
                         return
             
-                    if tunnel_name not in tunnel_names:
-                        continue
+                    if not parent_dict.get("resolved-peer"):
+                        return
             
                     payload = self.monitoring_manager.start_overlay_tunnel_monitoring(
                         tunnel=parent_dict,
@@ -2774,7 +2744,7 @@ class Agent:
                     satisfied += 1                                                                          # Candidate passes this SLO   
                     quality_margins.append((threshold - measured) / threshold if threshold > 0 else 0.0)    # Positive margin: larger means better
                 else:
-                    violations.append((measured - threshold) / threshold if threshold > 0 else 0.0)          # Normalize amount above maximum
+                    violations = ((measured - threshold) / threshold if threshold > 0 else 0.0)          # Normalize amount above maximum
                     
                     violations.append(violation)                              # Store current violation
                     quality_margins.append(-violation)                        # Failed SLO contributes negative quality
@@ -2786,8 +2756,8 @@ class Agent:
                 else:
                     violation = ((threshold - measured) / threshold if threshold > 0 else 0.0)
 
-                violations.append(violation)                              # Store current violation
-                quality_margins.append(-violation)                        # Failed SLO contributes negative quality
+                    violations.append(violation)                              # Store current violation
+                    quality_margins.append(-violation)                        # Failed SLO contributes negative quality
      
         max_violation = max(violations, default=0.0)                                                 # Largest individual SLO violation
         average_violation = (sum(violations) / len(violations) if violations  else 0.0)              # Average violation across failed SLOs
@@ -2845,6 +2815,9 @@ class Agent:
         
                 if not state:
                     continue
+
+                if state.get("oper-status") != "up":
+                    continue                                                        # Exclude unavailable/stale path from steering
         
                 candidates.append({"type": "wan-link","name": wan_name, "state": state })
 
