@@ -1678,9 +1678,7 @@ class Agent:
                     if policy.get("class") != class_name:                                  # skip policies for other traffic classes
                         continue                                                           # continue searching
     
-                    uses_wan_link = (                                                      # check whether this traffic class uses underlay WAN links
-                        policy.get("failover-link-type") == "wan-link"
-                        or policy.get("load-balance-link-type") == "wan-link")
+                    uses_wan_link = (policy.get("link-type") == "wan-link")                # New policy has one common link-type
     
                     if not uses_wan_link:                                      
                         logging.info("Skipping flow monitoring for class=%s because it uses tunnel steering", class_name )
@@ -1692,13 +1690,32 @@ class Agent:
                         logging.warning("Cannot start monitoring for class=%s because Forwarder fwmark is not available yet", class_name)
                         return
     
-                    wan_names = []                                                         # list of WAN candidates used by this policy
-    
-                    if policy.get("primary-wan-link"):                                     # include primary WAN if configured
-                        wan_names.append(policy.get("primary-wan-link"))                   # add primary WAN
-    
-                    wan_names.extend(self._as_list(policy.get("secondary-wan-link")))      # add failover secondary WANs
-                    wan_names.extend(self._as_list(policy.get("load-balance-wan-link")))   # add load-balance WANs
+                    wan_links = self._as_list(current_config.get("interfaces", {}).get("underlay", {}).get("wan-link", []))           # Automatically discover all configured WAN links
+                    
+                    for wan in wan_links:
+                        if not isinstance(wan, dict):
+                            continue
+                        if not wan.get("admin-enabled", True):
+                            continue                                                           # Do not monitor administratively disabled WAN
+                    
+                        wan_name = wan.get("name")
+                    
+                        if not wan_name:
+                            continue
+                    
+                        payload = self.monitoring_manager.start_underlay_flow_monitoring(
+                            traffic_class=parent_dict,
+                            steering_policy=policy,
+                            flow_id=flow_id,
+                            wan_link_name=wan_name
+                        )
+                    
+                        logging.info(
+                            "Started underlay monitoring for class=%s wan_link=%s payload=%s",
+                            class_name,
+                            wan_name,
+                            payload
+                        )
     
                     seen_wan_names = set()                                                 # avoid duplicate monitoring requests
     
@@ -1733,26 +1750,28 @@ class Agent:
             
                 for policy in self._as_list(policies):
             
-                    uses_tunnel = (
-                        policy.get("failover-link-type") == "tunnel"
-                        or policy.get("load-balance-link-type") == "tunnel"
-                    )
+                    uses_tunnel = (policy.get("link-type") == "tunnel")
             
                     if not uses_tunnel:
                         continue
             
                     tunnel_names = []
             
-                    if policy.get("primary-tunnel"):
-                        tunnel_names.append(policy.get("primary-tunnel"))
-            
-                    tunnel_names.extend(
-                        self._as_list(policy.get("secondary-tunnel"))
-                    )
-            
-                    tunnel_names.extend(
-                        self._as_list(policy.get("load-balance-tunnel"))
-                    )
+                    for policy in self._as_list(policies):
+                        if policy.get("link-type") != "tunnel":
+                            continue
+                    
+                        if not parent_dict.get("admin-enabled", True):
+                            return
+                    
+                        if not parent_dict.get("resolved-peer"):
+                            return
+                    
+                        payload = self.monitoring_manager.start_overlay_tunnel_monitoring(tunnel=parent_dict, steering_policy=policy)
+                    
+                        logging.info("Started overlay monitoring for tunnel=%s payload=%s", tunnel_name, payload)
+                    
+                        return
             
                     if tunnel_name not in tunnel_names:
                         continue
@@ -2775,6 +2794,7 @@ class Agent:
         configured = 0                                                       # Number of SLO constraints evaluated
         satisfied = 0                                                        # Number of SLO constraints satisfied
         violations = []                                                      # Normalized violations for failed SLOs
+        quality_margins = []                                                 # Normalized current multi-SLO quality margins
     
         for leaf_name, threshold in policy.items():                           # Examine every leaf in the steering policy
             if leaf_name.startswith("max-"):                                 
@@ -2803,7 +2823,7 @@ class Agent:
                 if measured <= threshold:
                     satisfied += 1                                                                          # Candidate passes this SLO   
                     quality_margins.append((threshold - measured) / threshold if threshold > 0 else 0.0)    # Positive margin: larger means better
-                elif:
+                else:
                     violations.append((measured - threshold) / threshold if threshold > 0 else 0.0)          # Normalize amount above maximum
                     
                     violations.append(violation)                              # Store current violation
@@ -2813,7 +2833,7 @@ class Agent:
                 if measured >= threshold:
                     satisfied += 1                                                                   # Candidate passes this SLO
                     quality_margins.append((measured - threshold) / threshold if threshold > 0 else 0.0)        # Positive margin: larger means better
-                elif:
+                else:
                     violation = ((threshold - measured) / threshold if threshold > 0 else 0.0)
 
                 violations.append(violation)                              # Store current violation
@@ -2840,7 +2860,7 @@ class Agent:
             "latency-ms": metric.get("latency_ms"),
             "jitter-ms": metric.get("jitter_ms"),
             "loss-percent": metric.get("loss_percent"),
-            "bandwidth-kbps": metric.get("available_bandwidth_kbps"),                 
+            "bandwidth-kbps": metric.get("bandwidth_kbps"),                 
             "metric-source": metric.get("source"),
             "metric-reason": metric.get("reason"),
             "metric-timestamp": metric.get("timestamp")}
@@ -2858,27 +2878,27 @@ class Agent:
         if not traffic_class:                                                             
             return candidates                                                            
     
-            if link_type == "wan-link":
-                wan_links = (current_config.get("interfaces", {}).get("underlay", {}).get("wan-link", []))
+        if link_type == "wan-link":
+            wan_links = (current_config.get("interfaces", {}).get("underlay", {}).get("wan-link", []))
         
-                for wan in self._as_list(wan_links):
+            for wan in self._as_list(wan_links):
         
-                    if not wan.get("admin-enabled", True):
-                        continue
+                if not wan.get("admin-enabled", True):
+                    continue
         
-                    wan_name = wan.get("name")
+                wan_name = wan.get("name")
         
-                    if not wan_name:
-                        continue
+                if not wan_name:
+                    continue
         
-                    state = (flow_state_map.get(traffic_class, {}).get(wan_name))
+                state = (flow_state_map.get(traffic_class, {}).get(wan_name))
         
-                    if not state:
-                        continue
+                if not state:
+                    continue
         
-                    candidates.append({"type": "wan-link","name": wan_name, "state": state })
+                candidates.append({"type": "wan-link","name": wan_name, "state": state })
 
-            elif link_type == "tunnel":
+        elif link_type == "tunnel":
                 tunnels = (current_config.get("overlay", {}).get("tunnel", []))
         
                 for tunnel in self._as_list(tunnels):
@@ -2940,7 +2960,7 @@ class Agent:
                     candidate["dependability"] = (self.metric_reader.get_wan_dependability(wan_link=candidate["name"]))              
 
                 elif candidate["type"] == "tunnel":
-                    candidate["dependability"] = (self.metric_reader.get_tunnel_dependability(tunnel_id=candidate["name"])sa)
+                    candidate["dependability"] = (self.metric_reader.get_tunnel_dependability(tunnel_id=candidate["name"]))
     
                 candidate["slo"] = self._evaluate_candidate_slo(
                     candidate["state"],                                                     # Current path metric snapshot
@@ -2967,12 +2987,12 @@ class Agent:
                         key=lambda candidate: (
                             self._candidate_dependability(candidate)
                             if self._candidate_dependability(candidate) is not None
-                            else -1.0,                                                        # First preference: historical dependability
-                            candidate["name"]                                                 # Final deterministic tie-breaker
+                            else -1.0,                                                        # 1. Historical dependability
+                    
+                            candidate["slo"]["current-multi-slo-quality"]                     # 2. Current multi-SLO quality
                         ),
                         reverse=True
                     )
-    
                     selected = ranked[0]                                                     # Best compliant path becomes active path
     
                     backup_order = [candidate["name"] for candidate in ranked[1:]]           # Remaining compliant paths become backups
@@ -3054,31 +3074,23 @@ class Agent:
             # =================================================================================
             # LOAD BALANCE
             # =================================================================================
-    
             elif steering_mode == "load-balance":
-    
                 # -------------------------------------------------------------------------
                 # Case 1: Fully compliant candidates exist
                 # -------------------------------------------------------------------------
-    
                 if compliant:
-    
                     ranked = sorted(
                         compliant,
                         key=lambda candidate: (
                             self._candidate_dependability(candidate)
                             if self._candidate_dependability(candidate) is not None
-                            else -1.0,                                                        # Historical dependability ordering
-    
-                            candidate["name"]                                                 # Deterministic tie-breaker
+                            else -1.0,                                                        # Historical dependability 
+                            candidate["slo"]["current-multi-slo-quality"]                     # Current multi-SLO quality
                         ),
                         reverse=True
                     )
-    
-                    eligible_names = [
-                        candidate["name"]
-                        for candidate in ranked
-                    ]                                                                        # All fully compliant candidates remain eligible
+                        
+                    eligible_names = [candidate["name"] for candidate in ranked]               # All fully compliant candidates remain eligible
     
                     decision = {
                         "action": "set-load-balance-policy",
@@ -3092,29 +3104,16 @@ class Agent:
                             "eligible": eligible_names
                         }
                     }
-    
-    
                 # -------------------------------------------------------------------------
                 # Case 2: No fully compliant candidate exists
                 # -------------------------------------------------------------------------
-    
                 else:
-    
-                    degraded = [
-                        candidate
-                        for candidate in non_severe
-                        if not candidate["slo"]["fully-compliant"]
-                    ]                                                                        # Keeps degraded but acceptable paths
+                    degraded = [candidate for candidate in non_severe if not candidate["slo"]["fully-compliant"]]         # Keeps degraded but acceptable paths
     
                     if degraded:
+                        max_satisfied = max(candidate["slo"]["satisfied-count"] for candidate in degraded)                # Finds maximum number of satisfied SLOs
     
-                        max_satisfied = max(
-                            candidate["slo"]["satisfied-count"]
-                            for candidate in degraded
-                        )                                                                    # Finds maximum number of satisfied SLOs
-    
-                        selected_group = [
-                            candidate
+                        selected_group = [candidate
                             for candidate in degraded
                             if candidate["slo"]["satisfied-count"] == max_satisfied
                         ]                                                                    # Keeps candidates tied on best SLO count
@@ -3122,13 +3121,11 @@ class Agent:
                         ranked = sorted(
                             selected_group,
                             key=lambda candidate: (
-                                -candidate["slo"]["average-normalized-violation"],            # First: smallest current degradation
-    
+                                -candidate["slo"]["average-normalized-violation"],                # 1. Smaller current SLO violation
+                        
                                 self._candidate_dependability(candidate)
                                 if self._candidate_dependability(candidate) is not None
-                                else -1.0,                                                    # Second: historical dependability
-    
-                                candidate["name"]                                             # Final deterministic tie-breaker
+                                else -1.0                                                         # 2. Historical dependability
                             ),
                             reverse=True
                         )
@@ -3333,65 +3330,56 @@ class Agent:
     
             if not traffic_class:
                 continue
-    
-            uses_wan_link = (
-                policy.get("failover-link-type") == "wan-link"
-                or policy.get("load-balance-link-type") == "wan-link"
-            )                                                                               # this policy uses underlay WAN links
-    
-            uses_tunnel = (
-                policy.get("failover-link-type") == "tunnel"
-                or policy.get("load-balance-link-type") == "tunnel"
-            )                                                                               # this policy uses overlay tunnels
-    
-            if uses_wan_link:
+
+            link_type = policy.get("link-type")                                       # Read common candidate path type from new YANG model
+            if link_type == "wan-link":
                 flow_id = self.flow_id_fwmarks.get(traffic_class)
-            
                 if flow_id is None:
                     logging.warning("Skipping underlay metric lookup for class=%s because fwmark is unavailable", traffic_class)
                     continue
             
                 flow_state_map.setdefault(traffic_class, {})
             
-                wan_names = []
+                wan_links = self._as_list(current_config.get("interfaces", {}).get("underlay", {}).get("wan-link", []))          # Automatically get all configured WAN links
             
-                if policy.get("primary-wan-link"):
-                    wan_names.append(policy.get("primary-wan-link"))
+                for wan in wan_links:
+                    if not isinstance(wan, dict):
+                        continue      
+                    if not wan.get("admin-enabled", True):
+                        continue                                                       # Skip administratively disabled WAN
             
-                wan_names.extend(self._as_list(policy.get("secondary-wan-link")))
-                wan_names.extend(self._as_list(policy.get("load-balance-wan-link")))
+                    wan_name = wan.get("name")
             
-                seen_wan_names = set()
-            
-                for wan_name in wan_names:
-                    if not wan_name or wan_name in seen_wan_names:
+                    if not wan_name:
                         continue
             
-                    seen_wan_names.add(wan_name)
+                    metric = self.metric_reader.get_flow_metric(flow_id, wan_name)                                     # Read current flow-specific metric for this WAN
+                    flow_state_map[traffic_class][wan_name] = (self._metric_to_candidate_state(wan_name, metric, flow_id))      
             
-                    metric = self.metric_reader.get_flow_metric(flow_id, wan_name)
+            elif link_type == "tunnel":  
+                tunnels = self._as_list(current_config.get("overlay", {}).get("tunnel", []))                           # Automatically get all configured tunnels
             
-                    flow_state_map[traffic_class][wan_name] = self._metric_to_candidate_state(wan_name, metric,flow_id)          # store one flow state per traffic class per wan link
-    
-            if uses_tunnel:
-                tunnel_names = []                                                           # collect tunnel candidates used by this policy
-    
-                if policy.get("primary-tunnel"):
-                    tunnel_names.append(policy.get("primary-tunnel"))
-    
-                tunnel_names.extend(self._as_list(policy.get("secondary-tunnel")))
-                tunnel_names.extend(self._as_list(policy.get("load-balance-tunnel")))
-    
-                for tunnel_name in tunnel_names:
-                    if not tunnel_name or tunnel_name in tunnel_state_map:
+                for tunnel in tunnels:
+                    if not isinstance(tunnel, dict):
                         continue
-    
-                    metric = self.metric_reader.get_tunnel_metric(tunnel_name)              # read tunnel health metric
-    
-                    tunnel_state_map[tunnel_name] = self._metric_to_candidate_state(
-                        tunnel_name,
-                        metric
-                    )                                                                       # store tunnel state by tunnel name
+            
+                    if not tunnel.get("admin-enabled", True):
+                        continue                                                       # Skip administratively disabled tunnel
+            
+                    if not tunnel.get("resolved-peer"):
+                        continue                                                       # Skip tunnel without resolved peer
+            
+                    tunnel_name = tunnel.get("name")
+            
+                    if not tunnel_name:
+                        continue
+            
+                    if tunnel_name in tunnel_state_map:
+                        continue                                                       # Avoid duplicate metric lookup
+            
+                    metric = self.metric_reader.get_tunnel_metric(tunnel_name)
+            
+                    tunnel_state_map[tunnel_name] = (self._metric_to_candidate_state(tunnel_name, metric))
     
         steering_decisions = self._make_steering_decisions(current_config, flow_state_map, tunnel_state_map )       # make steering decisions using flow and tunnel states
 
