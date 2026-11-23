@@ -227,7 +227,7 @@ class MetricReader:
             return self._empty_metric("influxdb query failed")
         
     # =====================================================================================
-    # Read underlay traffic-class metric using flow_id/fwmark
+    # Read underlay traffic-class metric and dependebility using flow_id/fwmark 
     # =====================================================================================
     def get_flow_metric(self, flow_id, wan_link_name):
         if self.reader_mode == "fake":                                                         # if dry-run mode is enabled
@@ -239,8 +239,9 @@ class MetricReader:
                 "flow_id": str(flow_id),
                 "wan_link": str(wan_link_name)
             })
+
     # =====================================================================================
-    # Read overlay tunnel metric
+    # Read overlay tunnel metric and get dependability
     # =====================================================================================
     def get_tunnel_metric(self, name):
         if self.reader_mode == "fake":                                                       # if dry-run mode is enabled
@@ -252,6 +253,164 @@ class MetricReader:
                 "tunnel_id": str(name)                                                       # tunnel metric is identified by tunnel_id, for example wg01
             } )
 
+    # =====================================================================================
+    # Dependability calculations
+    # =====================================================================================
+    def get_wan_dependability(self, wan_link, window_hours=24):
+        return self._get_path_dependability(
+            path_type="wan-link",                                             
+            path_id=wan_link,                                                                                        
+            window_hours=window_hours                                          # Historical observation period
+        )
+            
+    def get_tunnel_dependability(self, tunnel_id, window_hours=24):
+        return self._get_path_dependability(
+            path_type="tunnel",                                          
+            path_id=tunnel_id,                                                                              
+            window_hours=window_hours                                          # Historical observation period
+        )
+
+    def _get_path_dependability(self, path_type, path_id, flow_id=None, window_hours=24):
+        records = self._query_path_history(
+            path_type=path_type,                                               # wan-link or tunnel
+            path_id=path_id,                                                   # Path identifier
+            window_hours=window_hours                                          # Historical analysis window
+        )
+    
+        if not records:                                                        # No historical samples are available yet
+            return {
+                "availability-percent": None,
+                "reliability": None,
+                "mttf-seconds": None,
+                "mttr-seconds": None,
+                "mtbf-seconds": None,
+                "failure-count": 0,
+                "observation-seconds": 0,
+                "history-sufficient": False
+            }
+    
+        return self._calculate_dependability(records)                          # Calculate historical dependability statistics
+
+    def _query_path_history(self, path_type, path_id, window_hours=24):
+        if path_type == "wan-link":
+            measurement = "wan_health"                                        # Historical health measurement for underlay WAN links
+            extra_filter = (f'and r["wan_link"] == "{path_id}"')                            # Select only the required WAN link, Ex: UPL1
+    
+        elif path_type == "tunnel":
+            measurement = "tunnel_health"                                     # Historical health measurement for overlay tunnels
+            extra_filter = (f'and r["tunnel_id"] == "{path_id}"')                         # Select only the required tunnel, Ex: wg01
+        else:
+            return []                                                          # Unknown path type cannot be queried
+    
+        query = f'''
+            from(bucket: "{self.bucket}")
+              |> range(start: -{window_hours}h)
+              |> filter(fn: (r) =>
+                  r["_measurement"] == "{measurement}"
+                  and r["_field"] == "path_up"
+                  {extra_filter}
+              )
+              |> sort(columns: ["_time"])
+        '''                                                                    # Read chronological UP/DOWN history for this path
+    
+        tables = self.query_api.query(query=query,org=self.org)                      # Execute historical InfluxDB query
+    
+        records = []                                                           # Normalized history consumed by dependability calculation
+    
+        for table in tables:
+            for record in table.records:
+    
+                records.append({
+                    "timestamp": record.get_time(),                            # Time at which path health was recorded
+                    "path_up": int(record.get_value())                         # 1 = path UP, 0 = path DOWN
+                })
+    
+        return records                                                         # Return path-specific historical health records
+
+    def _calculate_dependability(self, records):
+        if len(records) < 2:                                                   # Need at least two samples to form a time interval
+            return {
+                "availability-percent": None,
+                "mttf-seconds": None,
+                "mttr-seconds": None,
+                "mtbf-seconds": None,
+                "failure-count": 0,
+                "observation-seconds": 0,
+                "history-sufficient": False
+            }
+    
+        total_up_time = 0.0                                                    # Total observed time during which path was UP
+        total_down_time = 0.0                                                  # Total observed time during which path was DOWN
+    
+        failure_count = 0                                                      # Number of UP -> DOWN transitions
+        recovery_count = 0                                                     # Number of DOWN -> UP transitions
+    
+        previous_state = records[0]["path_up"]                                 # Initial observed path state
+        previous_time = records[0]["timestamp"]                                # Timestamp of initial observation
+    
+        for record in records[1:]:
+            current_state = record["path_up"]                                  # Current UP/DOWN state
+            current_time = record["timestamp"]                                 # Timestamp of current state
+    
+            interval_seconds = (current_time - previous_time).total_seconds()           # Time for which previous state remained valid
+    
+            if previous_state == 1:
+                total_up_time += interval_seconds                              # Previous interval represented working path
+    
+            else:
+                total_down_time += interval_seconds                            # Previous interval represented unavailable path
+    
+            if previous_state == 1 and current_state == 0:
+                failure_count += 1                                             # Detect path failure
+    
+            elif previous_state == 0 and current_state == 1:
+                recovery_count += 1                                            # Detect path recovery
+    
+            previous_state = current_state                                     # Current value becomes previous state for next iteration
+            previous_time = current_time                                       # Current timestamp becomes start of next interval
+    
+        observation_seconds = (
+            total_up_time + total_down_time
+        )                                                                      # Total period represented by historical records
+    
+        availability = (
+            total_up_time / observation_seconds
+            if observation_seconds > 0
+            else None
+        )                                                                      # Fraction of observed period during which path was available
+    
+        mttf = (
+            total_up_time / failure_count
+            if failure_count > 0
+            else None
+        )                                                                      # Mean Time To Failure
+    
+        mttr = (
+            total_down_time / recovery_count
+            if recovery_count > 0
+            else None
+        )                                                                      # Mean Time To Repair
+    
+        mtbf = (
+            mttf + mttr
+            if mttf is not None and mttr is not None
+            else None
+        )                                                                      # Mean Time Between Failures
+    
+        return {
+            "availability-percent": (
+                availability * 100.0
+                if availability is not None
+                else None
+            ),
+            "mttf-seconds": mttf,
+            "mttr-seconds": mttr,
+            "mtbf-seconds": mtbf,
+            "failure-count": failure_count,
+            "observation-seconds": observation_seconds,
+            "history-sufficient": observation_seconds > 0
+        }
+  
     # =====================================================================================
     # Close InfluxDB client
     # =====================================================================================
