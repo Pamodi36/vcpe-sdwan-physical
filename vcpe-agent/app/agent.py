@@ -52,6 +52,7 @@ class Agent:
         self.applied_steering_decisions = {}                                          # traffic-class & currently applied decision key info
         self.pending_steering_decisions = {}                                          # traffic-class & candidate decision waiting for confirmation
         self.steering_confirm_cycles = 3                                              # wait and check whether decision is same for 03 consecutive cycles
+        self.severe_violation_percent = 50.0                                          # Threshold for the SLO violation
 
         self.startup_reconciled = False
         self.startup_reconcile_started = False
@@ -2770,40 +2771,59 @@ class Agent:
     # ===========================================================================================================
     # Runtime steering decisions (Decisions made according to Metric values recived from Monitoring module)
     # ===========================================================================================================
-    def _candidate_satisfies_slo(self, candidate_state, policy):
-        if not candidate_state:                                                            #If there is no state object, candidate is invalid.
-            return False
+    def _evaluate_candidate_slo(self, state, policy):
+        configured = 0                                                       # Number of SLO constraints evaluated
+        satisfied = 0                                                        # Number of SLO constraints satisfied
+        violations = []                                                      # Normalized violations for failed SLOs
+    
+        for leaf_name, threshold in policy.items():                           # Examine every leaf in the steering policy
+            if leaf_name.startswith("max-"):                                 
+                direction = "max"                                            
+                metric_name = leaf_name[4:]                                   # Remove "max-" prefix
+            elif leaf_name.startswith("min-"):                               
+                direction = "min"                                           
+                metric_name = leaf_name[4:]                                   # Remove "min-" prefix
+            else:
+                continue                                                      # Ignore class, steering-mode, link-type, etc.
+    
+            if threshold is None:
+                continue                                                      # Ignore SLO leaves without configured values
+    
+            measured = state.get(metric_name)                                 # Find corresponding measured metric
+    
+            if measured is None:
+                continue                                                    
+    
+            threshold = float(threshold)                                     
+            measured = float(measured)                                       
+    
+            configured += 1                                                   # One valid SLO is being evaluated
+    
+            if direction == "max":                                                
+                if measured <= threshold:
+                    satisfied += 1                                            # Candidate passes this SLO   
+                elif threshold > 0:
+                    violations.append((measured - threshold) / threshold)                # Normalize amount above maximum
 
-        oper_status = candidate_state.get("oper-status")                                   #Reads the operational status.
-        if oper_status not in ["up", "degraded"]:                                         #Only candidates with up or degraded are accepted. Anything else is rejected
-            return False
-
-        max_latency = policy.get("max-latency-ms")                                         #Reads max allowed latency from policy.
-        if max_latency is not None:
-            latency = candidate_state.get("latency-ms")                                    #Reads measured latency from state
-            if latency is None or latency > max_latency:                                   #Reject if latency is missing or exceeds the threshold.
-                return False
-
-        max_jitter = policy.get("max-jitter-ms")                                           #Reads max allowed jitter from policy.
-        if max_jitter is not None:
-            jitter = candidate_state.get("jitter-ms")                                      #Reads measured jitter from state
-            if jitter is None or jitter > max_jitter:                                      #Reject if jitter is missing or exceeds the threshold
-                return False
-
-        max_loss = policy.get("max-loss-percent")                                          #Reads max allowed packet loss from policy.
-        if max_loss is not None:
-            loss = candidate_state.get("loss-percent")                                     #Reads measured packet loss from state
-            if loss is None or loss > float(max_loss):                                     #Reject if packet loss is missing or exceeds the threshold
-                return False
-
-        min_bw = policy.get("min-bandwidth-kbps")                                          #Reads min allowed BW from policy.
-        if min_bw is not None:
-            bw = candidate_state.get("available-bandwidth-kbps")                           #Reads available BW from state
-            if bw is None or bw < min_bw:                                                  #Reject if BW is missing or less than the threshold
-                return False
-
-        return True                                                                        #If all checks pass, candidate satisfies the SLO
-
+            elif direction == "min":                                          
+                if measured >= threshold:
+                    satisfied += 1                                            # Candidate passes this SLO
+                elif threshold > 0:
+                    violations.append((threshold - measured) / threshold)                    # Normalize amount below minimum
+     
+        max_violation = max(violations, default=0.0)                                    # Largest individual SLO violation
+    
+        average_violation = (sum(violations) / len(violations) if violations  else 0.0)               # Average violation across failed SLOs
+    
+        return {
+            "configured-count": configured,                                   # Number of evaluated SLOs
+            "satisfied-count": satisfied,                                     # Number of SLOs passed
+            "fully-compliant": (configured > 0 and satisfied == configured),  # True only when every configured SLO passes
+            "max-normalized-violation": max_violation,                        # Used for severe classification
+            "average-normalized-violation": average_violation,                # Used for degraded-path ranking
+            "severe": (max_violation * 100.0 >= self.severe_violation_percent)
+        }
+        
     def _metric_to_candidate_state(self, name, metric, flow_id=None):
         state = {
             "name": name,                                                                  # WAN link name or tunnel name
@@ -2811,7 +2831,7 @@ class Agent:
             "latency-ms": metric.get("latency_ms"),
             "jitter-ms": metric.get("jitter_ms"),
             "loss-percent": metric.get("loss_percent"),
-            "available-bandwidth-kbps": metric.get("available_bandwidth_kbps"),
+            "bandwidth-kbps": metric.get("available_bandwidth_kbps"),                 
             "metric-source": metric.get("source"),
             "metric-reason": metric.get("reason"),
             "metric-timestamp": metric.get("timestamp")}
@@ -2821,64 +2841,56 @@ class Agent:
     
         return state
     
-    def _extract_candidate_states(self, policy, flow_state_map, tunnel_state_map):        # Build candidates using per-WAN flow metrics for underlay and tunnel metrics for overlay
-        traffic_class = policy.get("class")                                               # traffic class associated with this policy
-        steering_mode = policy.get("steering-mode")                                       # failover or load-balance
-        candidates = []                                                                   # final candidate list
+    def _extract_candidate_states(self, policy, current_config, flow_state_map, tunnel_state_map):        # Build candidates using per-WAN flow metrics for underlay and tunnel metrics for overlay
+        traffic_class = policy.get("class")                                          
+        link_type = policy.get("link-type")
+        candidates = []                                                                   
     
-        if not traffic_class:                                                             # traffic class is required
-            return candidates                                                             # without class, flow metric cannot be selected
+        if not traffic_class:                                                             
+            return candidates                                                            
     
-        if steering_mode == "failover":                                                   # failover selects first eligible candidate in order
-            failover_link_type = policy.get("failover-link-type")                         # wan-link or tunnel
-    
-            if failover_link_type == "wan-link":                                          # failover over underlay WAN links
-                ordered_names = []                                                        # candidate WAN links in policy order
-    
-                primary = policy.get("primary-wan-link")                                  # primary WAN link
-                if primary:                                                               # if primary is configured
-                    ordered_names.append(primary)                                         # add primary first
-    
-                ordered_names.extend(self._as_list(policy.get("secondary-wan-link")))     # add secondary WAN links after primary
-    
-                for wan_name in ordered_names:                                            # loop through candidate WAN links
-                    state = flow_state_map.get(traffic_class, {}).get(wan_name)           # get metric for this traffic class through this WAN link
-    
-                    if state:                                                             # if metric state exists
-                        candidates.append(("wan-link", wan_name, state))                  # add WAN candidate with its own metric state
-    
-            elif failover_link_type == "tunnel":                                          # failover over overlay tunnels
-                ordered_names = []                                                        # candidate tunnels in policy order
-    
-                primary = policy.get("primary-tunnel")                                    # primary tunnel
-                if primary:                                                               # if primary tunnel exists
-                    ordered_names.append(primary)                                         # add primary first
-    
-                ordered_names.extend(self._as_list(policy.get("secondary-tunnel")))       # add secondary tunnels after primary
-    
-                for tunnel_name in ordered_names:                                         # loop through candidate tunnels
-                    state = tunnel_state_map.get(tunnel_name)                             # get tunnel health metric
-    
-                    if state:                                                             # if metric state exists
-                        candidates.append(("tunnel", tunnel_name, state))                 # add tunnel candidate
-    
-        elif steering_mode == "load-balance":                                             # load-balance selects all eligible candidates
-            load_balance_link_type = policy.get("load-balance-link-type")                 # wan-link or tunnel
-    
-            if load_balance_link_type == "wan-link":                                      # load-balance over underlay WAN links
-                for wan_name in self._as_list(policy.get("load-balance-wan-link")):       # loop through configured WAN members
-                    state = flow_state_map.get(traffic_class, {}).get(wan_name)           # get metric for this traffic class through this WAN link
-    
-                    if state:                                                             # if metric state exists
-                        candidates.append(("wan-link", wan_name, state))                  # add WAN candidate with its own metric state
-    
-            elif load_balance_link_type == "tunnel":                                      # load-balance over overlay tunnels
-                for tunnel_name in self._as_list(policy.get("load-balance-tunnel")):      # loop through configured tunnel members
-                    state = tunnel_state_map.get(tunnel_name)                             # get tunnel health metric
-    
-                    if state:                                                             # if metric state exists
-                        candidates.append(("tunnel", tunnel_name, state))                 # add tunnel candidate
-    
+            if link_type == "wan-link":
+                wan_links = (current_config.get("interfaces", {}).get("underlay", {}).get("wan-link", []))
+        
+                for wan in self._as_list(wan_links):
+        
+                    if not wan.get("admin-enabled", True):
+                        continue
+        
+                    wan_name = wan.get("name")
+        
+                    if not wan_name:
+                        continue
+        
+                    state = (flow_state_map.get(traffic_class, {}).get(wan_name))
+        
+                    if not state:
+                        continue
+        
+                    candidates.append({"type": "wan-link","name": wan_name, "state": state })
+
+            elif link_type == "tunnel":
+                tunnels = (current_config.get("overlay", {}).get("tunnel", []))
+        
+                for tunnel in self._as_list(tunnels):
+        
+                    if not tunnel.get("admin-enabled", True):
+                        continue
+                    if not tunnel.get("resolved-peer"):
+                        continue
+        
+                    tunnel_name = tunnel.get("name")
+        
+                    if not tunnel_name:
+                        continue
+        
+                    state = tunnel_state_map.get(tunnel_name)
+        
+                    if not state:
+                        continue
+        
+                    candidates.append({"type": "tunnel", "name": tunnel_name,"state": state})
+
         return candidates                                                                 # return all candidates for this policy
     
     def _make_steering_decisions(self, current_config, flow_state_map, tunnel_state_map):
@@ -2887,12 +2899,12 @@ class Agent:
         steering_policies = current_config.get("policy", {}).get("steering", [])            #Reads steering policies from config.          
 
         for policy in steering_policies:                                                    #Loops through each steering policy.
-            traffic_class = policy.get("class")                                             #Reads traffic class associated with this policy.
+            traffic_class = policy.get("class")                           
             if not traffic_class:
-                continue                                                                    #Skip if missing
+                continue                                                            
 
-            steering_mode = policy.get("steering-mode")                                     #Reads steering mode
-            candidates = self._extract_candidate_states(policy, flow_state_map, tunnel_state_map) #Builds the list of candidate paths according to this policy.
+            steering_mode = policy.get("steering-mode")                                   
+            candidates = self._extract_candidate_states(policy, current_config,flow_state_map, tunnel_state_map) #Builds the list of candidate paths according to this policy from CPE configuration.
 
             eligible = []                                                                   #Creates lists for accepted and rejected candidates
             rejected = []
