@@ -1808,7 +1808,6 @@ class Agent:
             # Traffic class monitoring
             # ============================================================
             if object_type == "class":
-    
                 class_name = parent_dict.get("name")
     
                 if not class_name:
@@ -1818,11 +1817,7 @@ class Agent:
                 flow_id = self.flow_id_fwmarks.get(class_name)
     
                 if flow_id is None:
-                    logging.warning(
-                        "Cannot stop monitoring for class=%s because "
-                        "Forwarder fwmark is not available yet",
-                        class_name,
-                    )
+                    logging.warning("Cannot stop monitoring for class=%s because " "Forwarder fwmark is not available yet", class_name,)
                     return
     
                 policy = steering_policy                                              # Use the explicitly supplied OLD steering policy. Do NOT read current_config_cache here.
@@ -1834,56 +1829,25 @@ class Agent:
                         class_name,
                     )
                     return
-    
-                wan_names = []
-    
-                # --------------------------------------------------------
-                # Collect WAN candidates from OLD steering policy
-                # --------------------------------------------------------
-    
-                if policy.get("primary-wan-link"):
-                    wan_names.append(
-                        policy.get("primary-wan-link")
-                    )
-    
-                wan_names.extend(
-                    self._as_list(
-                        policy.get("secondary-wan-link")
-                    )
-                )
-    
-                wan_names.extend(
-                    self._as_list(
-                        policy.get("load-balance-wan-link")
-                    )
-                )
-    
-                # --------------------------------------------------------
-                # Stop old underlay monitoring jobs
-                # --------------------------------------------------------
-    
-                for wan_name in set(wan_names):
-                    if not wan_name:
-                        continue
-    
-                    self.monitoring_manager.stop_underlay_flow_monitoring(
-                        flow_id,
-                        wan_name,
-                    )
+
+                if policy.get("link-type") == "wan-link":                                  # Old steering policy used WAN-link candidates
+                    wan_links = self._as_list(self.current_config_cache.get("interfaces", {}).get("underlay", {}).get("wan-link", []))        # Read all configured WAN links
+                
+                    for wan in wan_links:       
+                        if not isinstance(wan, dict):
+                            continue
+                
+                        wan_name = wan.get("name")
+                
+                        if not wan_name:
+                            continue
+                
+                        self.monitoring_manager.stop_underlay_flow_monitoring(flow_id, wan_name)          # Stop this traffic-class monitoring job on this WAN
     
                 if remove_fwmark:                                                # Remove fwmark only when the class itself is deleted. Do NOT remove it for a steering policy modification.
-                    self.flow_id_fwmarks.pop(
-                        class_name,
-                        None,
-                    )
+                    self.flow_id_fwmarks.pop(class_name, None)
     
-                logging.info(
-                    "Stopped underlay monitoring for class=%s "
-                    "flow_id=%s remove_fwmark=%s",
-                    class_name,
-                    flow_id,
-                    remove_fwmark,
-                )
+                logging.info("Stopped underlay monitoring for class=%s " "flow_id=%s remove_fwmark=%s", class_name, flow_id, remove_fwmark)
     
             # ============================================================
             # Tunnel monitoring
@@ -2343,7 +2307,6 @@ class Agent:
                     class_name = old_parent_dict.get("class")
             
                 if class_name:
-            
                     # ---------------------------------------------------------
                     # First stop jobs belonging to the OLD steering policy.
                     # ---------------------------------------------------------
@@ -2356,46 +2319,33 @@ class Agent:
                     # ---------------------------------------------------------
                     # After commit, start/update jobs using NEW policy.
                     # ---------------------------------------------------------
-                    uses_tunnel = (
-                        new_parent_dict.get("failover-link-type") == "tunnel"
-                        or new_parent_dict.get("load-balance-link-type") == "tunnel"
-                    )
+                    uses_tunnel = (new_parent_dict.get("link-type") == "tunnel")                   # New steering model uses one common link-type
                     
                     if uses_tunnel:
-                        tunnel_names = []
                     
-                        tunnel_names.extend(
-                            self._as_list(new_parent_dict.get("primary-tunnel"))
-                        )
-                        tunnel_names.extend(
-                            self._as_list(new_parent_dict.get("secondary-tunnel"))
-                        )
-                        tunnel_names.extend(
-                            self._as_list(new_parent_dict.get("load-balance-tunnel"))
-                        )
+                        tunnels = self._as_list(self.current_config_cache.get("overlay", {}).get("tunnel", []))     # Automatically discover all configured tunnels
                     
-                        for tunnel_name in set(tunnel_names):
-                            if not tunnel_name:
+                        for tunnel in tunnels:
+                            if not isinstance(tunnel, dict):
                                 continue
+                            if not tunnel.get("admin-enabled", True):
+                                continue                                                           # Skip administratively disabled tunnel
+                            if not tunnel.get("resolved-peer"):
+                                continue                                                           # Skip tunnel without resolved peer information
                     
-                            for tunnel in self._as_list(
-                                self.current_config_cache.get("overlay", {}).get("tunnel", [])
-                            ):
-                                if tunnel.get("name") == tunnel_name:
-                                    monitoring_start_candidates.append({
-                                        "object_type": "tunnel",
-                                        "parent_dict": tunnel,
-                                        "steering_policy": new_parent_dict
-                                    })
-                                    break
+                            monitoring_start_candidates.append({
+                                "object_type": "tunnel",
+                                "parent_dict": tunnel,
+                                "steering_policy": new_parent_dict
+                            })                                                                      # Start/update shared tunnel monitoring
                     
                     else:
                         monitoring_start_candidates.append({
                             "object_type": "class",
                             "class_name": class_name,
                             "steering_policy": new_parent_dict
-                        })                                   
-            
+                        })                                                                          # WAN steering: start monitoring for this traffic class
+                        
         added = root.find("added")                                                      # contains newly added datastore objects
         
         if added is not None:
