@@ -584,86 +584,14 @@
             "Traffic steering method";
         }
 
-        leaf load-balance-link-type {
-          when "../steering-mode = 'load-balance'";
+        leaf link-type {
           type enumeration {
-            enum tunnel;
             enum wan-link;
-            enum path-group;
-          }
-          mandatory true;
-          description
-            "Traffic steering method";
-        }
-
-        leaf-list load-balance-tunnel {
-          when "../steering-mode = 'load-balance' and ../load-balance-link-type = 'tunnel'";
-          type leafref {
-            path "/scpe:sdwan/scpe:overlay/scpe:tunnel/scpe:name";
-          }
-          description
-            "Overlay tunnel names used for load balancing";
-        }
-
-        leaf-list load-balance-wan-link {
-          when "../steering-mode = 'load-balance' and ../load-balance-link-type = 'wan-link'";
-          type leafref {
-            path "/scpe:sdwan/scpe:interfaces/scpe:underlay/scpe:wan-link/scpe:name";
-          }
-          description
-            "Underlay transport link IDs used for load balancing";
-        }
-
-        leaf failover-link-type {
-          when "../steering-mode = 'failover'";
-          type enumeration {
             enum tunnel;
-            enum wan-link;
-            enum path-group;
           }
           mandatory true;
           description
-            "Traffic steering method";
-        }
-
-        leaf primary-tunnel {
-          when "../steering-mode = 'failover' and ../failover-link-type = 'tunnel'";
-          mandatory true;
-          type leafref {
-            path "/scpe:sdwan/scpe:overlay/scpe:tunnel/scpe:name";
-          }
-          description
-            "Primary preferred overlay tunnel";
-        }
-
-        leaf primary-wan-link {
-          when "../steering-mode = 'failover' and ../failover-link-type = 'wan-link'";
-          mandatory true;
-          type leafref {
-            path "/scpe:sdwan/scpe:interfaces/scpe:underlay/scpe:wan-link/scpe:name";
-          }
-          description
-            "Primary preferred underlay link";
-        }
-
-        leaf-list secondary-tunnel {
-          when "../steering-mode = 'failover' and ../failover-link-type = 'tunnel'";
-          ordered-by user;
-          type leafref {
-            path "/scpe:sdwan/scpe:overlay/scpe:tunnel/scpe:name";
-          }
-          description
-            "Secondary preferred overlay tunnel(s) use when the primary tunnel is down";
-        }
-
-        leaf-list secondary-wan-link {
-          when "../steering-mode = 'failover' and ../failover-link-type = 'wan-link'";
-          ordered-by user;
-          type leafref {
-            path "/scpe:sdwan/scpe:interfaces/scpe:underlay/scpe:wan-link/scpe:name";
-          }
-          description
-            "Secondary preferred underlay link(s) used when the primary link is down";
+            "Type of candidate path automatically considered by the Agent.";
         }
       }
     }
