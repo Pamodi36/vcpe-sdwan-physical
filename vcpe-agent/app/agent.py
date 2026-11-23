@@ -2797,23 +2797,31 @@ class Agent:
             threshold = float(threshold)                                     
             measured = float(measured)                                       
     
-            configured += 1                                                   # One valid SLO is being evaluated
+            configured += 1                                                                           # One valid SLO is being evaluated
     
             if direction == "max":                                                
                 if measured <= threshold:
-                    satisfied += 1                                            # Candidate passes this SLO   
-                elif threshold > 0:
-                    violations.append((measured - threshold) / threshold)                # Normalize amount above maximum
-
+                    satisfied += 1                                                                          # Candidate passes this SLO   
+                    quality_margins.append((threshold - measured) / threshold if threshold > 0 else 0.0)    # Positive margin: larger means better
+                elif:
+                    violations.append((measured - threshold) / threshold if threshold > 0 else 0.0)          # Normalize amount above maximum
+                    
+                    violations.append(violation)                              # Store current violation
+                    quality_margins.append(-violation)                        # Failed SLO contributes negative quality
+                    
             elif direction == "min":                                          
                 if measured >= threshold:
-                    satisfied += 1                                            # Candidate passes this SLO
-                elif threshold > 0:
-                    violations.append((threshold - measured) / threshold)                    # Normalize amount below minimum
+                    satisfied += 1                                                                   # Candidate passes this SLO
+                    quality_margins.append((measured - threshold) / threshold if threshold > 0 else 0.0)        # Positive margin: larger means better
+                elif:
+                    violation = ((threshold - measured) / threshold if threshold > 0 else 0.0)
+
+                violations.append(violation)                              # Store current violation
+                quality_margins.append(-violation)                        # Failed SLO contributes negative quality
      
-        max_violation = max(violations, default=0.0)                                    # Largest individual SLO violation
-    
-        average_violation = (sum(violations) / len(violations) if violations  else 0.0)               # Average violation across failed SLOs
+        max_violation = max(violations, default=0.0)                                                 # Largest individual SLO violation
+        average_violation = (sum(violations) / len(violations) if violations  else 0.0)              # Average violation across failed SLOs
+        current_quality = (sum(quality_margins) / len(quality_margins) if quality_margins else 0.0)  # Overall normalized current multi-SLO quality
     
         return {
             "configured-count": configured,                                   # Number of evaluated SLOs
@@ -2821,6 +2829,7 @@ class Agent:
             "fully-compliant": (configured > 0 and satisfied == configured),  # True only when every configured SLO passes
             "max-normalized-violation": max_violation,                        # Used for severe classification
             "average-normalized-violation": average_violation,                # Used for degraded-path ranking
+            "current-multi-slo-quality": current_quality,                     # Combined current quality of all configured SLOs
             "severe": (max_violation * 100.0 >= self.severe_violation_percent)
         }
         
@@ -2892,104 +2901,275 @@ class Agent:
                     candidates.append({"type": "tunnel", "name": tunnel_name,"state": state})
 
         return candidates                                                                 # return all candidates for this policy
+
+    # ===========================================================================================================
+    # Dependability helper
+    # ===========================================================================================================
+    def _candidate_dependability(self, candidate):
+        dependability = candidate.get("dependability", {})                                # Read historical path statistics
+    
+        if not dependability.get("history-sufficient", False):
+            return None                                                                    # Unknown history must not be interpreted as bad history
+    
+        availability = dependability.get("availability-percent")                           # Use historical availability for current ranking
+    
+        if availability is None:
+            return None                                                        # No usable dependability score
+    
+        return float(availability)                                             # Higher historical availability means better path
     
     def _make_steering_decisions(self, current_config, flow_state_map, tunnel_state_map):
-        decisions = []                                                                      #Creates an empty list for steering decisions.
-
-        steering_policies = current_config.get("policy", {}).get("steering", [])            #Reads steering policies from config.          
-
-        for policy in steering_policies:                                                    #Loops through each steering policy.
-            traffic_class = policy.get("class")                           
+        decisions = []                                                                      
+    
+        steering_policies = current_config.get("policy", {}).get("steering", [])            # Reads steering policies from config
+    
+        for policy in steering_policies:                                                    
+            traffic_class = policy.get("class")                                             # Gets traffic class associated with this policy
+    
             if not traffic_class:
-                continue                                                            
-
+                continue                                                                
+    
             steering_mode = policy.get("steering-mode")                                   
-            candidates = self._extract_candidate_states(policy, current_config,flow_state_map, tunnel_state_map) #Builds the list of candidate paths according to this policy from CPE configuration.
+    
+            candidates = self._extract_candidate_states(policy, current_config, flow_state_map, tunnel_state_map)    # Builds candidate paths automatically from CPE configuration
+            # =================================================================================
+            # Add historical dependability and current SLO evaluation
+            # =================================================================================
+            for candidate in candidates:                                                    
+                if candidate["type"] == "wan-link":
+                    candidate["dependability"] = (self.metric_reader.get_wan_dependability(wan_link=candidate["name"]))              
 
-            eligible = []                                                                   #Creates lists for accepted and rejected candidates
-            rejected = []
-
-            for link_type, name, state in candidates:                                       #Loops through each candidate.
-                if self._candidate_satisfies_slo(state, policy):
-                    eligible.append((link_type, name, state))                               #If candidate passes SLO checks, put it in eligible
-                else:
-                    rejected.append({                                                       #If candidate fails, add summary info into rejected
-                        "name": name,
-                        "link-type": link_type,
-                        "oper-status": state.get("oper-status"),
-                        "latency-ms": state.get("latency-ms"),
-                        "jitter-ms": state.get("jitter-ms"),
-                        "loss-percent": state.get("loss-percent"),
-                        "available-bandwidth-kbps": state.get("available-bandwidth-kbps")})
-
-            now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())                     #Creates current UTC timestamp in ISO-like format.
-
-            if steering_mode == "failover":                                                 #Enter failover logic.
-                if eligible:                                                                #If at least one candidate satisfies the SLO
-                    selected_link_type, selected_name, selected_state = eligible[0]          #Choose the first eligible candidate.
-
-                    if candidates and selected_name == candidates[0][1]:
-                        reason = "primary path satisfies SLO"
-                    else:
-                        reason = "primary path failed SLO; failed over to next eligible path"
-
+                elif candidate["type"] == "tunnel":
+                    candidate["dependability"] = (self.metric_reader.get_tunnel_dependability(tunnel_id=candidate["name"])sa)
+    
+                candidate["slo"] = self._evaluate_candidate_slo(
+                    candidate["state"],                                                     # Current path metric snapshot
+                    policy                                                                  # SLO thresholds configured for this traffic class
+                ) 
+            # =================================================================================
+            # Group candidates according to current SLO condition
+            # =================================================================================
+            compliant = [candidate for candidate in candidates if candidate["slo"]["fully-compliant"]]    # Candidates satisfying every configured SLO
+            non_severe = [candidate for candidate in candidates if not candidate["slo"]["severe"]]        # Candidates without severe SLO violation
+    
+            now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())                                   # Current UTC timestamp
+        
+            # =================================================================================
+            # FAILOVER
+            # =================================================================================
+            if steering_mode == "failover":
+                # -------------------------------------------------------------------------
+                # Case 1: At least one fully compliant candidate exists
+                # -------------------------------------------------------------------------
+                if compliant:
+                    ranked = sorted(
+                        compliant,
+                        key=lambda candidate: (
+                            self._candidate_dependability(candidate)
+                            if self._candidate_dependability(candidate) is not None
+                            else -1.0,                                                        # First preference: historical dependability
+                            candidate["name"]                                                 # Final deterministic tie-breaker
+                        ),
+                        reverse=True
+                    )
+    
+                    selected = ranked[0]                                                     # Best compliant path becomes active path
+    
+                    backup_order = [candidate["name"] for candidate in ranked[1:]]           # Remaining compliant paths become backups
+    
                     decision = {
                         "action": "set-active-path",
                         "traffic-class": traffic_class,
-                        "selected-path": selected_name,
-                        "selected-path-type": selected_link_type,
+                        "selected-path": selected["name"],
+                        "selected-path-type": policy.get("link-type"),
                         "decision-status": "selected",
-                        "reason": reason,
+                        "reason": "fully compliant path selected using historical dependability",
                         "last-change": now_ts,
                         "candidate-summary": {
-                            "eligible": [item[1] for item in eligible],
-                            "rejected": rejected}}
-                else:                                                                       #If no candidate is eligible, creates a no-path decision.
-                    decision = {
-                        "action": "set-active-path",
-                        "traffic-class": traffic_class,
-                        "selected-path": None,
-                        "selected-path-type": policy.get("failover-link-type"),
-                        "decision-status": "no-path",
-                        "reason": "no candidate satisfies SLO or candidates are down",
-                        "last-change": now_ts,
-                        "candidate-summary": {
-                            "eligible": [],
-                            "rejected": rejected}}
-
+                            "active": selected["name"],        
+                            "backup-order": backup_order
+                        }
+                    }
+                # -------------------------------------------------------------------------
+                # Case 2: No fully compliant candidate exists
+                # -------------------------------------------------------------------------
+                else:
+                    degraded = [candidate for candidate in non_severe if not candidate["slo"]["fully-compliant"]]     # Keeps only degraded but non-severe candidates
+    
+                    if degraded:
+                        max_satisfied = max(candidate["slo"]["satisfied-count"] for candidate in degraded)            # Finds highest number of satisfied SLOs
+    
+                        best_group = [candidate for candidate in degraded
+                            if candidate["slo"]["satisfied-count"] == max_satisfied]                                  # Keeps candidates tied on best SLO count
+    
+                        ranked = sorted(
+                            best_group,
+                            key=lambda candidate: (
+                                self._candidate_dependability(candidate)
+                                if self._candidate_dependability(candidate) is not None
+                                else -1.0,                                                                     # First: historical dependability
+                                -candidate["slo"]["average-normalized-violation"],                             # Second: smaller current violation
+                                candidate["slo"]["current-multi-slo-quality"]                     # 3. Better overall current SLO quality
+                            ),
+                            reverse=True                                                                        # Used by sorting for higher values to come first
+                        )
+    
+                        selected = ranked[0]                                                  # Best degraded candidate becomes active
+    
+                        backup_order = [candidate["name"] for candidate in ranked[1:]]        # Remaining tied candidates become backups
+    
+                        decision = {
+                            "action": "set-active-path",
+                            "traffic-class": traffic_class,
+                            "selected-path": selected["name"],
+                            "selected-path-type": policy.get("link-type"),
+                            "decision-status": "selected",
+                            "reason": "best non-severe degraded path selected using SLO count and historical dependability",
+                            "last-change": now_ts,
+                            "candidate-summary": {
+                                "active": selected["name"],
+                                "backup-order": backup_order
+                            }
+                        }
+    
+                    else:
+    
+                        decision = {
+                            "action": "set-active-path",
+                            "traffic-class": traffic_class,
+                            "selected-path": None,
+                            "selected-path-type": policy.get("link-type"),
+                            "decision-status": "no-path",
+                            "reason": "no acceptable candidate path is available",
+                            "last-change": now_ts,
+                            "candidate-summary": {
+                                "active": None,
+                                "backup-order": []
+                            }
+                        }
+    
                 decisions.append(decision)
-
-            elif steering_mode == "load-balance":                                          #Enter load-balance logic
-                if eligible:                                                                #If some candidates satisfy SLO:
-                    eligible_names = [item[1] for item in eligible]
-
-                    decision = {                                                            #Creates load-balance decision listing all selected paths
+    
+    
+            # =================================================================================
+            # LOAD BALANCE
+            # =================================================================================
+    
+            elif steering_mode == "load-balance":
+    
+                # -------------------------------------------------------------------------
+                # Case 1: Fully compliant candidates exist
+                # -------------------------------------------------------------------------
+    
+                if compliant:
+    
+                    ranked = sorted(
+                        compliant,
+                        key=lambda candidate: (
+                            self._candidate_dependability(candidate)
+                            if self._candidate_dependability(candidate) is not None
+                            else -1.0,                                                        # Historical dependability ordering
+    
+                            candidate["name"]                                                 # Deterministic tie-breaker
+                        ),
+                        reverse=True
+                    )
+    
+                    eligible_names = [
+                        candidate["name"]
+                        for candidate in ranked
+                    ]                                                                        # All fully compliant candidates remain eligible
+    
+                    decision = {
                         "action": "set-load-balance-policy",
                         "traffic-class": traffic_class,
                         "eligible-paths": eligible_names,
-                        "selected-path-type": policy.get("load-balance-link-type"),
+                        "selected-path-type": policy.get("link-type"),
                         "decision-status": "selected",
-                        "reason": "Candidates satisfying SLO for Load-Balance",
+                        "reason": "fully compliant candidates selected for load balancing",
                         "last-change": now_ts,
                         "candidate-summary": {
-                            "eligible": eligible_names,
-                            "rejected": rejected}}
-                else:                                                                       #If none are eligible, create a no-path load-balance decision.
-                    decision = {
-                        "action": "set-load-balance-policy",
-                        "traffic-class": traffic_class,
-                        "eligible-paths": [],
-                        "selected-path-type": policy.get("load-balance-link-type"),
-                        "decision-status": "no-path",
-                        "reason": "no load-balance candidate satisfies SLO or candidates are down",
-                        "last-change": now_ts,
-                        "candidate-summary": {
-                            "eligible": [],
-                            "rejected": rejected}}
-
+                            "eligible": eligible_names
+                        }
+                    }
+    
+    
+                # -------------------------------------------------------------------------
+                # Case 2: No fully compliant candidate exists
+                # -------------------------------------------------------------------------
+    
+                else:
+    
+                    degraded = [
+                        candidate
+                        for candidate in non_severe
+                        if not candidate["slo"]["fully-compliant"]
+                    ]                                                                        # Keeps degraded but acceptable paths
+    
+                    if degraded:
+    
+                        max_satisfied = max(
+                            candidate["slo"]["satisfied-count"]
+                            for candidate in degraded
+                        )                                                                    # Finds maximum number of satisfied SLOs
+    
+                        selected_group = [
+                            candidate
+                            for candidate in degraded
+                            if candidate["slo"]["satisfied-count"] == max_satisfied
+                        ]                                                                    # Keeps candidates tied on best SLO count
+    
+                        ranked = sorted(
+                            selected_group,
+                            key=lambda candidate: (
+                                -candidate["slo"]["average-normalized-violation"],            # First: smallest current degradation
+    
+                                self._candidate_dependability(candidate)
+                                if self._candidate_dependability(candidate) is not None
+                                else -1.0,                                                    # Second: historical dependability
+    
+                                candidate["name"]                                             # Final deterministic tie-breaker
+                            ),
+                            reverse=True
+                        )
+    
+                        eligible_names = [
+                            candidate["name"]
+                            for candidate in ranked
+                        ]
+    
+                        decision = {
+                            "action": "set-load-balance-policy",
+                            "traffic-class": traffic_class,
+                            "eligible-paths": eligible_names,
+                            "selected-path-type": policy.get("link-type"),
+                            "decision-status": "selected",
+                            "reason": "best non-severe degraded candidates selected for load balancing",
+                            "last-change": now_ts,
+                            "candidate-summary": {
+                                "eligible": eligible_names
+                            }
+                        }
+    
+                    else:
+    
+                        decision = {
+                            "action": "set-load-balance-policy",
+                            "traffic-class": traffic_class,
+                            "eligible-paths": [],
+                            "selected-path-type": policy.get("link-type"),
+                            "decision-status": "no-path",
+                            "reason": "no acceptable load-balance candidate is available",
+                            "last-change": now_ts,
+                            "candidate-summary": {
+                                "eligible": []
+                            }
+                        }
+    
                 decisions.append(decision)
+    
+        return decisions                                                                     # Returns all calculated steering decisions
 
-        return decisions                                                                     #returns all steering decisions.
 
     def _stabilize_steering_decisions(self, steering_decisions):
         stable_decisions = []
