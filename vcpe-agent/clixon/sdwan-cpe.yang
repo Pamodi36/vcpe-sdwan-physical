@@ -578,9 +578,9 @@
             enum load-balance;
             enum failover;
           }
-          default "failover";
+          default "load-balance";
           description
-            "Traffic steering method";
+            "Traffic steering method for the traffic class";
         }
 
         leaf link-type {
@@ -590,7 +590,7 @@
           }
           mandatory true;
           description
-            "Type of candidate path automatically considered by the Agent.";
+            "List of related candidate paths will be automatically considered by the Agent";
         }
       }
     }
