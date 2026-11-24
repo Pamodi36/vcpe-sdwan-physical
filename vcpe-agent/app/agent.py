@@ -2394,6 +2394,38 @@ class Agent:
                                 "object_type": "tunnel",
                                 "parent_dict": parent_dict
                             })
+
+                    elif object_type == "steering":
+                        class_name = parent_dict.get("class")
+                    
+                        if parent_dict.get("link-type") == "tunnel":
+                    
+                            tunnels = self._as_list(self.current_config_cache
+                                .get("overlay", {})
+                                .get("tunnel", [])
+                            )
+                    
+                            for tunnel in tunnels:
+                                if not isinstance(tunnel, dict):
+                                    continue
+                                if not tunnel.get("admin-enabled", True):
+                                    continue
+                                if not tunnel.get("resolved-peer"):
+                                    continue
+                    
+                                monitoring_start_candidates.append({
+                                    "object_type": "tunnel",
+                                    "parent_dict": tunnel,
+                                    "steering_policy": parent_dict
+                                })
+                    
+                        elif parent_dict.get("link-type") == "wan-link":
+                    
+                            monitoring_start_candidates.append({
+                                "object_type": "class",
+                                "class_name": class_name,
+                                "steering_policy": parent_dict
+                            })
                     
                     elif object_type == "overlay":
                         for tunnel in self._as_list(parent_dict.get("tunnel")):
@@ -2528,7 +2560,17 @@ class Agent:
                             delete=False
                         )
                     )
+                if (
+                    deleted_xml is not None
+                    and self._local_name(deleted_xml.tag) == "policy"
+                ):
+                    steering_xml = self._first_child(deleted_xml)
                 
+                    if (
+                        steering_xml is not None
+                        and self._local_name(steering_xml.tag) == "steering"
+                    ):
+                        deleted_xml = steering_xml
                 
                 # Preserve existing behaviour for other partial tunnel deletions
                 for node in other_tunnel_deleted_nodes:
@@ -2561,28 +2603,26 @@ class Agent:
                     ):
                         deleted_xml = class_xml
         
-                operations.extend(
-                    self._build_operations_from_parent_xml(
-                        deleted_xml,
-                        ["*"],
-                        delete=True
-                    )
-                )                                                                                     # process non-tunnel deletions normally
+                operations.extend(self._build_operations_from_parent_xml(deleted_xml, ["*"], delete=True))           # process non-tunnel deletions normally
         
                 if deleted_xml is not None:
-        
                     object_type = self._local_name(deleted_xml.tag)                                   # determine deleted object type
                     parent_dict = self._xml_to_dict(deleted_xml)                                      # convert deleted object into Python dict
+
+                    if object_type == "steering":
+                        class_name = parent_dict.get("class")
+                        if class_name:
+                            monitoring_stop_candidates.append({
+                                "object_type": "steering",
+                                "class_name": class_name,
+                                "steering_policy": parent_dict,
+                                "new_steering_policy": {}})
         
                     if object_type == "class":
                         class_name = parent_dict.get("name")                                  # deleted traffic class name
                         old_steering_policy = None                                            # default if no policy exists
                     
-                        policies = self.current_config_cache.get(
-                            "policy", {}
-                        ).get(
-                            "steering", []
-                        )
+                        policies = self.current_config_cache.get("policy", {}).get("steering", [])
                     
                         for policy in self._as_list(policies):                                # search policy belonging to deleted class
                             if policy.get("class") == class_name:
@@ -3063,12 +3103,17 @@ class Agent:
                     degraded = [candidate for candidate in non_severe if not candidate["slo"]["fully-compliant"]]         # Keeps degraded but acceptable paths
     
                     if degraded:
-                        max_satisfied = max(candidate["slo"]["satisfied-count"] for candidate in degraded)                # Finds maximum number of satisfied SLOs
-    
-                        selected_group = [candidate
-                            for candidate in degraded
-                            if candidate["slo"]["satisfied-count"] == max_satisfied
-                        ]                                                                    # Keeps candidates tied on best SLO count
+                        ranked = sorted(
+                            degraded,
+                            key=lambda candidate: (
+                                -candidate["slo"]["average-normalized-violation"],
+                        
+                                self._candidate_dependability(candidate)
+                                if self._candidate_dependability(candidate) is not None
+                                else -1.0
+                            ),
+                            reverse=True
+                        )                                                                 # Keeps candidates tied on best SLO count
     
                         ranked = sorted(
                             selected_group,
