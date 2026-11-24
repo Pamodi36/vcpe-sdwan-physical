@@ -271,14 +271,22 @@ class MetricReader:
 
     def _get_path_dependability(self, path_type, path_id, flow_id=None, window_hours=24):
         if self.reader_mode == "fake":
+            fake_dependability = {
+                "UPL1": 99.0,
+                "UPL2": 95.0,
+                "wg-upl2-upl2": 98.0,
+                "wg-upl1-upl2": 94.0,
+                "wg-upl2-upl1": 90.0,
+                "wg-upl1-upl1": 85.0 }       
+            availability = fake_dependability.get(path_id)
             return {
-                "availability-percent": None,
-                "mttf-seconds": None,
-                "mttr-seconds": None,
-                "mtbf-seconds": None,
-                "failure-count": 0,
-                "observation-seconds": 0,
-                "history-sufficient": False
+                "availability-percent": availability,
+                "mttf-seconds": 7200,
+                "mttr-seconds": 120,
+                "mtbf-seconds": 7320,
+                "failure-count": 2,
+                "observation-seconds": 86400,
+                "history-sufficient": availability is not None
             }
         records = self._query_path_history(
             path_type=path_type,                                               # wan-link or tunnel
