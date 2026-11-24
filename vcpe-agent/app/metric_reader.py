@@ -34,7 +34,7 @@ class MetricReader:
             "latency_ms": None,                                                      
             "jitter_ms": None,                                                        
             "loss_percent": None,                                                    
-            "available_bandwidth_kbps": None,                                         
+            "bandwidth_kbps": None,                                         
             "timestamp": None,                                                      
             "stale": True,                                                             
             "source": self.reader_mode,                                                     
@@ -59,9 +59,10 @@ class MetricReader:
             "latency_ms": values.get("latency_ms"),                                     
             "jitter_ms": values.get("jitter_ms"),                                       
             "loss_percent": values.get("loss_percent"),                             
-            "available_bandwidth_kbps": values.get("available_bandwidth_kbps"),        
+            "bandwidth_kbps": values.get("available_bandwidth_kbps"),        
             "timestamp": timestamp.isoformat(),                                        
             "stale": stale,                                                                         # True if metric is too old
+            "reason": reason,
             "source": self.reader_mode,
         }
     # =====================================================================================
@@ -271,6 +272,16 @@ class MetricReader:
         )
 
     def _get_path_dependability(self, path_type, path_id, flow_id=None, window_hours=24):
+        if self.reader_mode == "fake":
+            return {
+                "availability-percent": None,
+                "mttf-seconds": None,
+                "mttr-seconds": None,
+                "mtbf-seconds": None,
+                "failure-count": 0,
+                "observation-seconds": 0,
+                "history-sufficient": False
+            }
         records = self._query_path_history(
             path_type=path_type,                                               # wan-link or tunnel
             path_id=path_id,                                                   # Path identifier
@@ -303,7 +314,7 @@ class MetricReader:
             return []                                                          # Unknown path type cannot be queried
     
         query = f'''
-            from(bucket: "{self.bucket}")
+            from(bucket: "{self.influx_bucket}")
               |> range(start: -{window_hours}h)
               |> filter(fn: (r) =>
                   r["_measurement"] == "{measurement}"
@@ -313,7 +324,7 @@ class MetricReader:
               |> sort(columns: ["_time"])
         '''                                                                    # Read chronological UP/DOWN history for this path
     
-        tables = self.query_api.query(query=query,org=self.org)                      # Execute historical InfluxDB query
+        tables = self.query_api.query(query=query, org=self.influx_org)                      # Execute historical InfluxDB query
     
         records = []                                                           # Normalized history consumed by dependability calculation
     
