@@ -2560,17 +2560,6 @@ class Agent:
                             delete=False
                         )
                     )
-                if (
-                    deleted_xml is not None
-                    and self._local_name(deleted_xml.tag) == "policy"
-                ):
-                    steering_xml = self._first_child(deleted_xml)
-                
-                    if (
-                        steering_xml is not None
-                        and self._local_name(steering_xml.tag) == "steering"
-                    ):
-                        deleted_xml = steering_xml
                 
                 # Preserve existing behaviour for other partial tunnel deletions
                 for node in other_tunnel_deleted_nodes:
@@ -2602,6 +2591,18 @@ class Agent:
                         and self._local_name(class_xml.tag) == "class"
                     ):
                         deleted_xml = class_xml
+
+                if (
+                    deleted_xml is not None
+                    and self._local_name(deleted_xml.tag) == "policy"
+                ):
+                    steering_xml = self._first_child(deleted_xml)
+                
+                    if (
+                        steering_xml is not None
+                        and self._local_name(steering_xml.tag) == "steering"
+                    ):
+                        deleted_xml = steering_xml
         
                 operations.extend(self._build_operations_from_parent_xml(deleted_xml, ["*"], delete=True))           # process non-tunnel deletions normally
         
