@@ -322,21 +322,21 @@ class MetricReader:
                   {extra_filter}
               )
               |> sort(columns: ["_time"])
-        '''                                                                    # Read chronological UP/DOWN history for this path
-    
-        tables = self.query_api.query(query=query, org=self.influx_org)                      # Execute historical InfluxDB query
-    
-        records = []                                                           # Normalized history consumed by dependability calculation
-    
-        for table in tables:
-            for record in table.records:
-    
-                records.append({
-                    "timestamp": record.get_time(),                            # Time at which path health was recorded
-                    "path_up": int(record.get_value())                         # 1 = path UP, 0 = path DOWN
-                })
-    
-        return records                                                         # Return path-specific historical health records
+        '''                                                                                    # Read chronological UP/DOWN history for this path
+        try:
+            tables = self.query_api.query(query=query, org=self.influx_org)                    # Execute historical InfluxDB query
+            records = []                                                                       # Normalized history consumed by dependability calculation
+            for table in tables:
+                for record in table.records:
+        
+                    records.append({
+                        "timestamp": record.get_time(),                                        # Time at which path health was recorded
+                        "path_up": int(record.get_value()) })                                   # 1 = path UP, 0 = path DOWN
+            return records                                                         # Return path-specific historical health records
+
+        except Exception as e:
+            logging.exception("Failed to read path history from InfluxDB ""path_type=%s path_id=%s: %s", path_type, path_id, e)
+        return []
 
     def _calculate_dependability(self, records):
         if len(records) < 2:                                                   # Need at least two samples to form a time interval
