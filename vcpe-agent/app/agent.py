@@ -3112,20 +3112,7 @@ class Agent:
                                 if self._candidate_dependability(candidate) is not None
                                 else -1.0
                             ),
-                            reverse=True
-                        )                                                                 # Keeps candidates tied on best SLO count
-    
-                        ranked = sorted(
-                            selected_group,
-                            key=lambda candidate: (
-                                -candidate["slo"]["average-normalized-violation"],                # 1. Smaller current SLO violation
-                        
-                                self._candidate_dependability(candidate)
-                                if self._candidate_dependability(candidate) is not None
-                                else -1.0                                                         # 2. Historical dependability
-                            ),
-                            reverse=True
-                        )
+                            reverse=True)                                                                 # Rank degraded candidates by lower SLO violation, then historical dependability
     
                         eligible_names = [
                             candidate["name"]
