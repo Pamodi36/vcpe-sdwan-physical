@@ -919,7 +919,7 @@ class Agent:
                     f"<loss-percent>{loss}</loss-percent>"
                 )
 
-            bandwidth = metric_state.get("available-bandwidth-kbps")
+            bandwidth = metric_state.get("bandwidth-kbps")
             if bandwidth is not None:
                 xml_parts.append(
                     f"<available-bandwidth-kbps>{int(bandwidth)}</available-bandwidth-kbps>"
@@ -2284,15 +2284,14 @@ class Agent:
                         monitoring_stop_candidates.append({
                             "object_type": "steering",
                             "class_name": class_name,
-                            "steering_policy": old_parent_dict,  })
-            
+                            "steering_policy": old_parent_dict,
+                            "new_steering_policy": new_parent_dict})
                     # ---------------------------------------------------------
                     # After commit, start/update jobs using NEW policy.
                     # ---------------------------------------------------------
                     uses_tunnel = (new_parent_dict.get("link-type") == "tunnel")                   # New steering model uses one common link-type
                     
                     if uses_tunnel:
-                    
                         tunnels = self._as_list(self.current_config_cache.get("overlay", {}).get("tunnel", []))     # Automatically discover all configured tunnels
                     
                         for tunnel in tunnels:
@@ -2626,22 +2625,49 @@ class Agent:
                         "class",
                         item["parent_dict"],
                         steering_policy=item.get("steering_policy"),                        # OLD steering policy
-                        remove_fwmark=True                                                  # class is really deleted
-                    )
+                        remove_fwmark=True)                                                 # class is really deleted
             
-                elif item["object_type"] == "steering":                                     # steering policy changed
-                    self._stop_monitoring_for_object(
-                        "class",
-                        {"name": item["class_name"]},                                       # class still exists
-                        steering_policy=item.get("steering_policy"),                        # OLD steering policy
-                        remove_fwmark=False                                                 # keep fwmark mapping
-                    )
+                elif item["object_type"] == "steering":
+                    old_policy = item.get("steering_policy") or {}
+                    new_policy = item.get("new_steering_policy") or {} 
+
+                    if old_policy.get("link-type") == "wan-link":                            # Old policy used WAN-link monitoring
+                
+                        self._stop_monitoring_for_object(
+                            "class",
+                            {"name": item["class_name"]},
+                            steering_policy=old_policy,
+                            remove_fwmark=False)
+
+                    elif (old_policy.get("link-type") == "tunnel" and new_policy.get("link-type") != "tunnel"):        # Policy changed from tunnel to WAN-link
+                
+                        other_tunnel_policy_exists = any(
+                            isinstance(policy, dict)
+                            and policy.get("class") != item["class_name"]
+                            and policy.get("link-type") == "tunnel"
+                            for policy in self._as_list(
+                                self.current_config_cache
+                                .get("policy", {})
+                                .get("steering", [])
+                            )
+                        )                                                                  # Check whether another traffic class still needs tunnel monitoring
             
+                        if not other_tunnel_policy_exists:
+                            tunnels = self._as_list(
+                                self.current_config_cache
+                                .get("overlay", {})
+                                .get("tunnel", [])
+                            )
+                            for tunnel in tunnels:
+                                if not isinstance(tunnel, dict):
+                                    continue                
+                                if not tunnel.get("name"):
+                                    continue
+                
+                                self._stop_monitoring_for_object("tunnel", tunnel)          # Stop shared tunnel monitor only when no class still needs it
+                            
                 elif item["object_type"] == "tunnel":                                       # tunnel deleted
-                    self._stop_monitoring_for_object(
-                        "tunnel",
-                        item["parent_dict"]
-                    )
+                    self._stop_monitoring_for_object("tunnel", item["parent_dict"])
 
             for item in monitoring_start_candidates:                                        # start/update monitoring only after real commit
                 if item["object_type"] == "class":                                           # traffic class added/changed or steering changed
@@ -2728,6 +2754,8 @@ class Agent:
     
             if threshold is None:
                 continue                                                      # Ignore SLO leaves without configured values
+
+            configured += 1                                                   # One valid SLO is being evaluated
     
             measured = state.get(metric_name)                                 # Find corresponding measured metric
     
@@ -2737,14 +2765,12 @@ class Agent:
             threshold = float(threshold)                                     
             measured = float(measured)                                       
     
-            configured += 1                                                                           # One valid SLO is being evaluated
-    
             if direction == "max":                                                
                 if measured <= threshold:
                     satisfied += 1                                                                          # Candidate passes this SLO   
                     quality_margins.append((threshold - measured) / threshold if threshold > 0 else 0.0)    # Positive margin: larger means better
                 else:
-                    violations = ((measured - threshold) / threshold if threshold > 0 else 0.0)          # Normalize amount above maximum
+                    violation = ((measured - threshold) / threshold if threshold > 0 else 0.0)          # Normalize amount above maximum
                     
                     violations.append(violation)                              # Store current violation
                     quality_margins.append(-violation)                        # Failed SLO contributes negative quality
@@ -2840,6 +2866,9 @@ class Agent:
         
                     if not state:
                         continue
+
+                    if state.get("oper-status") != "up":
+                        continue                                                          # Exclude unavailable/stale tunnel
         
                     candidates.append({"type": "tunnel", "name": tunnel_name,"state": state})
 
